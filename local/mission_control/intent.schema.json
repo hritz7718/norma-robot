@@ -1,0 +1,16 @@
+{
+  "type": "object", "additionalProperties": false,
+  "required": ["decision", "task_type", "target", "reason"],
+  "properties": {
+    "decision": {"type": "string", "enum": ["accepted", "rejected"]},
+    "task_type": {"type": "string", "enum": ["pick_up", "inspect", "unsupported"]},
+    "target": {
+      "type": "object", "additionalProperties": false, "required": ["object", "color"],
+      "properties": {
+        "object": {"type": "string", "enum": ["block", "cube", "object", "unknown"]},
+        "color": {"type": "string", "enum": ["blue", "red", "yellow", "green", "unspecified"]}
+      }
+    },
+    "reason": {"type": "string", "minLength": 1, "maxLength": 500}
+  }
+}

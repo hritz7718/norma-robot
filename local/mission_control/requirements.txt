@@ -1,0 +1,6 @@
+# The API and Station client use Python's standard library.
+# Pillow generates the explicitly labeled simulation camera frames only.
+Pillow>=10
+numpy>=1.24
+opencv-contrib-python>=4.8,<5
+mediapipe>=0.10.30,<0.11

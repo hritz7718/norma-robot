@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "method": "taught_xy_grid",
+  "units": "mm",
+  "follower": "5B8E113018",
+  "motor_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "camera_unique_id": "11391:19040:3:53",
+  "image_size": [
+    299,
+    224
+  ],
+  "calibration_path": "local/calibration/tabletop_homography.json",
+  "calibration_signature": "2f1203732086f9b6c6d10f18c6380e9fb3124e100b1888b164a42f814a98cb7c",
+  "safe_height_mm": null,
+  "physically_validated": false,
+  "motion_enabled": false,
+  "points": [],
+  "saved_at": 1795344879.527401
+}

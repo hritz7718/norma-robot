@@ -169,6 +169,29 @@ def build_sync_write_command(
 # ---------------------------------------------------------------------------
 # One-tick inference + command build
 
+def load_policy(checkpoint: Path):
+    """Load once and retain the returned policy, statistics, and device."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    stats = {k: v.to(device) for k, v in load_stats(checkpoint / "stats.safetensors").items()}
+    policy = SmolVLAPolicy.from_pretrained(
+        checkpoint, config_overrides={"load_vlm_weights": False}, strict=False,
+    ).to(device)
+    policy.eval()
+    return policy, stats, device
+
+
+@torch.no_grad()
+def predict_goals(frame, policy, stats, task, device):
+    """Return the first action without clipping, so callers can reject invalid output."""
+    batch, ranges = frame_to_batch(frame, stats, IMAGE_KEYS, device)
+    tokens, mask = policy.tokenize_task(task, device=device)
+    batch["observation.language.tokens"] = tokens
+    batch["observation.language.attention_mask"] = mask
+    prediction = policy.predict_action_chunk(batch)[0]
+    goals = unnormalize_action(prediction, stats)[0].detach().cpu().numpy()
+    return goals, ranges
+
+
 @torch.no_grad()
 def predict_commands(
     frame: normvla.FrameReader,
@@ -180,14 +203,8 @@ def predict_commands(
     device: torch.device,
 ) -> tuple[commands.DriverCommand, np.ndarray, np.ndarray, list[tuple[int, int]]]:
     """Returns (single sync-write command, predicted_goal_norm[6], raw_ticks[6], ranges)."""
-    batch, ranges = frame_to_batch(frame, stats, IMAGE_KEYS, device)
-    tokens, mask = policy.tokenize_task(task, device=device)
-    batch["observation.language.tokens"] = tokens
-    batch["observation.language.attention_mask"] = mask
-
-    pred_norm = policy.predict_action_chunk(batch)[0]        # (chunk_size, 6)
-    pred_goal = unnormalize_action(pred_norm, stats)          # in [0, 1]-ish
-    next_goal = pred_goal[0].cpu().clamp(0.0, 1.0).numpy()    # (6,)
+    goals, ranges = predict_goals(frame, policy, stats, task, device)
+    next_goal = goals.clip(0.0, 1.0)
 
     raws: list[int] = []
     for g_norm, (rmin, rmax) in zip(next_goal, ranges):
@@ -302,20 +319,11 @@ async def main_async() -> None:
     logger = logging.getLogger("run_policy")
     motor_ids = [int(x) for x in args.motor_ids.split(",")]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     stats_path = args.checkpoint / "stats.safetensors"
     if not stats_path.exists():
         raise SystemExit(f"No stats.safetensors in {args.checkpoint}.")
-    stats = {k: v.to(device) for k, v in load_stats(stats_path).items()}
-
-    print(f"loading {args.checkpoint} on {device} ...")
-    policy = SmolVLAPolicy.from_pretrained(
-        args.checkpoint,
-        config_overrides={"load_vlm_weights": False},
-        strict=False,
-    ).to(device)
-    policy.eval()
+    print(f"loading {args.checkpoint} ...")
+    policy, stats, device = load_policy(args.checkpoint)
 
     print(f"task:      {args.task!r}")
     print(f"server:    {args.server}")

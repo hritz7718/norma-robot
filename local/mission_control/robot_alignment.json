@@ -1,0 +1,29 @@
+{
+  "verified": false,
+  "follower": "5B8E113018",
+  "motor_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+  "mat_id": "operator-bench-mat-200-205",
+  "urdf": "hardware/elrobot/simulation/elrobot_follower.urdf",
+  "tool_link": "Gripper_Base_v1_1",
+  "tool_offset_mm": null,
+  "tool_radius_mm": null,
+  "joint_zero_ticks": null,
+  "joint_radians_per_tick": null,
+  "joint_ranges_ticks": null,
+  "table_to_base_mm": null,
+  "registration_table_to_image": null,
+  "robot_and_mat_fixed": false,
+  "base_reference": {
+    "marker_id": 312,
+    "marker_to_base_mm": null,
+    "fixed_relative_to_base": false,
+    "coplanar_with_mat": false
+  },
+  "registration_verified": false,
+  "workspace_clearance_verified": false,
+  "workspace_bounds_table_mm": null,
+  "maximum_obstacle_height_mm": null,
+  "clearance_mm": null,
+  "safe_height_mm": 200,
+  "verification_samples": []
+}

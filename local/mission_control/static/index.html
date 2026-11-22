@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Mission Control</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Mission Control <span>Vision → SmolVLA</span></h1>
+      <span id="connection-state" class="muted" role="status">Connecting…</span>
+    </header>
+
+    <section class="panel command-panel" aria-label="Robot instruction">
+      <label for="instruction">Instruction</label>
+      <textarea id="instruction" maxlength="1000" rows="2" placeholder="Pick up the blue block"></textarea>
+      <div class="run-settings">
+        <label for="run-seconds">Duration · seconds
+          <input id="run-seconds" type="number" min="1" max="300" step="1" value="120" required>
+        </label>
+        <label for="max-delta-ticks">Max step · ticks per joint
+          <input id="max-delta-ticks" type="number" min="1" max="1000" step="1" value="300" required>
+        </label>
+        <label for="safe-height-mm">Approach height · mm
+          <input id="safe-height-mm" type="number" min="1" max="500" step="1" value="200" required>
+        </label>
+      </div>
+      <div class="controls">
+        <button id="execute-button" class="execute" type="button" disabled>Execute</button>
+        <button id="stop-button" class="stop" type="button" disabled>STOP</button>
+        <div class="run-status" role="status">
+          <strong id="execution-status">Stopped</strong>
+          <span id="action-count" class="muted">0 actions</span>
+          <span id="run-time" class="muted"></span>
+        </div>
+      </div>
+      <p id="status-detail" class="muted" role="status">Enter an instruction, then click Execute.</p>
+      <p id="interpreted-instruction" class="muted" hidden></p>
+      <p id="hand-warning" class="hand-warning" role="alert">Starting hand monitor…</p>
+      <p class="muted">Hand monitoring covers the full workspace image. The red camera zone is independent of the four homography references; its surrounding image border gives a yellow warning.</p>
+      <div class="voice-controls">
+        <select id="speech-voice" aria-label="Alert voice"><option value="auto">Automatic · best available voice</option></select>
+        <button id="speech-button" type="button">Test voice</button>
+        <span id="speech-status" class="muted" role="status">Click Test voice to enable spoken alerts.</span>
+      </div>
+      <p class="muted">Hand monitoring is a camera-based prototype. Red stops VLA commands; it does not stop teleoperation or replace a physical emergency stop.</p>
+      <p class="muted">STOP cancels software commands and leaves torque unchanged. It is not a physical emergency stop.</p>
+      <p id="request-error" class="error" role="alert" hidden></p>
+    </section>
+
+    <section class="cameras" aria-label="Live cameras">
+      <figure class="panel camera-card">
+        <figcaption><strong>Workspace</strong><span id="camera-status-workspace" class="muted">Waiting</span></figcaption>
+        <div class="camera-image">
+          <img id="camera-workspace" alt="Live workspace camera" hidden>
+          <span id="camera-placeholder-workspace">Waiting for camera</span>
+        </div>
+      </figure>
+      <figure class="panel camera-card">
+        <figcaption><strong>Wrist</strong><span id="camera-status-wrist" class="muted">Waiting</span></figcaption>
+        <div class="camera-image">
+          <img id="camera-wrist" alt="Live wrist camera" hidden>
+          <span id="camera-placeholder-wrist">Waiting for camera</span>
+        </div>
+      </figure>
+    </section>
+
+    <section class="panel" aria-labelledby="joints-heading">
+      <div class="section-heading"><h2 id="joints-heading">Follower joints</h2><span id="joint-summary" class="muted">Waiting for feedback</span></div>
+      <div class="table-scroll">
+        <table>
+          <caption class="sr-only">Live feedback for all eight Follower joints</caption>
+          <thead><tr><th>Joint</th><th>Position · ticks</th><th>Last target</th><th title="Commanded change from feedback at the time of the last action">Last step</th><th>Torque</th><th>Feedback</th></tr></thead>
+          <tbody id="joint-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <details class="panel diagnostics">
+      <summary>Troubleshooting</summary>
+      <dl class="diagnostic-values">
+        <div><dt>Codex interpreter</dt><dd id="diag-interpreter">—</dd></div>
+        <div><dt>Interpretation time</dt><dd id="diag-interpretation-time">—</dd></div>
+        <div><dt>Codex image input</dt><dd id="diag-image-input">—</dd></div>
+        <div><dt>Object detection</dt><dd id="diag-detection">—</dd></div>
+        <div><dt>Robot approach</dt><dd id="diag-approach">—</dd></div>
+        <div><dt>Supervised VLA handoff</dt><dd id="diag-handoff">—</dd></div>
+        <div><dt>Grasp verification</dt><dd id="diag-verification">—</dd></div>
+        <div><dt>Model / device</dt><dd id="diag-model">—</dd></div>
+        <div><dt>Model load time</dt><dd id="diag-load">—</dd></div>
+        <div><dt>Last inference</dt><dd id="diag-inference">—</dd></div>
+        <div><dt>Last action latency</dt><dd id="diag-cycle">—</dd></div>
+        <div><dt>Average actions / second</dt><dd id="diag-rate">—</dd></div>
+        <div><dt>Last Station write</dt><dd id="diag-write">—</dd></div>
+        <div><dt>Camera observation</dt><dd id="diag-observation">—</dd></div>
+        <div><dt>Oldest joint feedback</dt><dd id="diag-feedback">—</dd></div>
+        <div><dt>Mirroring · last check</dt><dd id="diag-mirroring">—</dd></div>
+        <div><dt>Joints limited by max step</dt><dd id="diag-limited">—</dd></div>
+        <div><dt>Prediction boundary clamping</dt><dd id="diag-clamped">—</dd></div>
+        <div><dt>Station</dt><dd id="diag-station">—</dd></div>
+        <div><dt>Follower</dt><dd id="diag-follower">—</dd></div>
+        <div class="wide"><dt>Checkpoint</dt><dd id="diag-checkpoint">—</dd></div>
+        <div class="wide"><dt>Original instruction</dt><dd id="diag-original-prompt">—</dd></div>
+        <div class="wide"><dt>Instruction sent to SmolVLA</dt><dd id="diag-prompt">—</dd></div>
+        <div class="wide"><dt>Codex interpretation reason</dt><dd id="diag-interpretation-reason">—</dd></div>
+        <div class="wide"><dt>Last stop reason</dt><dd id="diag-stop">—</dd></div>
+      </dl>
+      <p class="muted">Last target and last step describe the last acknowledged action. Highlighted targets were clamped to calibrated bounds; highlighted steps were capped by your max step setting.</p>
+      <p id="diag-faults" class="error" hidden></p>
+    </details>
+
+    <section class="panel" aria-labelledby="logs-heading">
+      <h2 id="logs-heading">Logs</h2>
+      <ol id="logs" aria-label="Execution logs"><li class="muted">Waiting for logs…</li></ol>
+    </section>
+    <noscript>Enable JavaScript to use Mission Control.</noscript>
+  </main>
+</body>
+</html>

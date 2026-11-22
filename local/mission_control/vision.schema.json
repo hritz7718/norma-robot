@@ -1,0 +1,31 @@
+{
+  "type": "object", "additionalProperties": false,
+  "required": ["decision", "task_type", "target", "reason", "visual"],
+  "properties": {
+    "decision": {"type": "string", "enum": ["accepted", "rejected"]},
+    "task_type": {"type": "string", "enum": ["pick_up", "inspect", "unsupported"]},
+    "target": {
+      "type": "object", "additionalProperties": false, "required": ["object", "color"],
+      "properties": {
+        "object": {"type": "string", "enum": ["block", "cube", "object", "unknown"]},
+        "color": {"type": "string", "enum": ["blue", "red", "yellow", "green", "unspecified"]}
+      }
+    },
+    "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+    "visual": {
+      "type": "object", "additionalProperties": false,
+      "required": ["detected", "confidence", "bbox"],
+      "properties": {
+        "detected": {"type": "boolean"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "bbox": {
+          "type": "object", "additionalProperties": false, "required": ["x0", "y0", "x1", "y1"],
+          "properties": {
+            "x0": {"type": "integer", "minimum": 0}, "y0": {"type": "integer", "minimum": 0},
+            "x1": {"type": "integer", "minimum": 0}, "y1": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

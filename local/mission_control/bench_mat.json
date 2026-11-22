@@ -1,0 +1,17 @@
+{
+  "mat_id": "operator-bench-mat-200-205",
+  "coordinate_units": "mm",
+  "dictionary": "AUTO",
+  "marker_centres_mm": {
+    "202": [-75, 262], "203": [75, 262],
+    "204": [-75, 146], "205": [75, 146],
+    "200": [-75, 30], "201": [75, 30]
+  },
+  "outer_corner_ids": [202, 203, 201, 200],
+  "scale_reference": {
+    "measured_horizontal_centre_distance_mm": null,
+    "measured_vertical_centre_distance_mm": null,
+    "physically_measured": false
+  },
+  "gripper_marker_id": null
+}

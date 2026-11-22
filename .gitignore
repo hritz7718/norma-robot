@@ -16,3 +16,11 @@ station-linux-amd64.tar.gz
 calibration-backup.zip
 dataset-mp4/
 dataset-generator/
+
+# Local robot runtime, recordings, logs, and reproducible model downloads.
+/runtime/
+/probe_cam*.jpg
+/local/episode_dashboard_logs/
+/local/episode_dashboard_state.json
+/local/recording-bounds.env
+/local/mission_control/assets/*.task
