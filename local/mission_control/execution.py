@@ -21,7 +21,7 @@ from .interpreter import blue_fallback_intent
 from .vision import Vision, VisionError, cancelled
 from .positioning import load_mapping, AlignmentError
 from .hands import HandMonitor
-from .config import HAND_MAX_AGE_SECONDS, TAUGHT_POINTS
+from .config import TAUGHT_POINTS, MANUAL_CALIBRATION, CAMERA_CALIBRATION
 
 
 class Execution:
@@ -32,6 +32,8 @@ class Execution:
         self.vision = Vision()
         self.default_safe_height = self.safe_height = safe_height
         self.mapping = None
+        self.execution_mode = None
+        self.motion_ranges = None
         self.movement_ready = False
         self.default_duration, self.default_max_delta_ticks = duration, max_delta_ticks
         self.duration, self.max_delta_ticks, self.mock = duration, max_delta_ticks, mock
@@ -54,29 +56,24 @@ class Execution:
                      "prediction_tolerance": PREDICTION_BOUND_TOLERANCE}
         self.data.update(original_prompt=None, interpretation=None, interpretation_ms=None)
         self.data.update(safe_height_mm=safe_height, detection=None, approach=None, image_input=None,
-                         verification=None, interpretation_source=None, vla_step_limit=None)
-        self.hands = HandMonitor(self._hand_trip, self.vision)
+                         verification=None, interpretation_source=None, vla_step_limit=None,
+                         execution_mode=None, mode_reason=None)
+        self.hands = HandMonitor(self._hand_warning, self.vision)
         self.station.on_observation = self._observe_workspace
         self.hands.start()
 
     def _observe_workspace(self, jpeg, frame_id, camera=None):
-        self.vision.observe(jpeg, frame_id, camera)
+        try:
+            if self.execution_mode == "direct_vla":
+                self.vision.observe_pixels(jpeg, frame_id)
+            else:
+                self.vision.observe(jpeg, frame_id, camera)
+        except Exception as exc:
+            self._hand_warning(f"Workspace image processing failed: {str(exc)[:160]}")
         self.hands.submit(jpeg, frame_id, camera)
 
-    def _hand_trip(self, reason):
-        with self.lock:
-            active = self.data["active"]
-        if active:
-            self.stop(reason, error=True)
-        else:
-            self.log("warning", reason)
-
-    def _hand_problem(self):
-        camera = self.station.snapshot()
-        age = camera.get("camera_age_ms", {}).get("workspace")
-        if not camera.get("camera_live", {}).get("workspace") or age is None or age > HAND_MAX_AGE_SECONDS*1000:
-            return "Workspace camera is stale or unavailable. VLA STOP."
-        return self.hands.problem()
+    def _hand_warning(self, reason):
+        self.log("warning", reason)
 
     def snapshot(self):
         with self.lock:
@@ -119,16 +116,14 @@ class Execution:
             feedback = self.station.snapshot()
             if not feedback.get("camera_live", {}).get("workspace"):
                 raise RuntimeError(feedback.get("camera_error") or "A fresh workspace camera image is required for calibration.")
-            age = feedback.get("camera_age_ms", {}).get("workspace")
-            if age is None or age > HAND_MAX_AGE_SECONDS*1000:
-                raise RuntimeError("Workspace camera is too old for hand monitoring.")
-            # Only an explicit Execute click clears a recovered monitor STOP.
-            self.hands.rearm()
             self.duration, self.max_delta_ticks = float(duration), max_delta_ticks
             self.safe_height, self.mapping, self.movement_ready = float(safe_height), None, False
+            self.execution_mode = None
+            self.motion_ranges = None
+            self.vision.reset()
             self.cancel = threading.Event()
             self.data.update(state="RUNNING", active=True, commands_sent=0, error=None,
-                             stage="Calibrating", original_prompt=prompt,
+                             stage="Checking setup", original_prompt=prompt,
                              prompt=None, interpretation=None, interpretation_ms=None,
                              started_at=time.time(), owner="Calibration",
                              teleoperation="Checking mirroring", stop_reason=None,
@@ -137,14 +132,14 @@ class Execution:
                              write_status="No write", last_action=None,
                              last_prediction=None, clamped_predictions=0, safe_height_mm=self.safe_height,
                              detection=None, approach=None, image_input=None, verification=None,
-                             interpretation_source=None, vla_step_limit=None)
+                             interpretation_source=None, vla_step_limit=None, execution_mode=None, mode_reason=None)
             # Loading cannot move the robot and must not consume the run's
             # movement budget or require a second Execute click.
             self.deadline = None
             self.run_started = self.run_finished = None
             threading.Thread(target=self._thread, args=(prompt, self.cancel), daemon=True,
                              name="mission-execution").start()
-        self.log("info", f"Execute: {prompt!r}; calibrate → detect → verified {self.safe_height:g}mm approach → supervised SmolVLA. Run limit {self.duration:g}s.")
+        self.log("info", f"Execute: {prompt!r}; choose positioning + VLA when setup is valid, otherwise direct VLA. Run limit {self.duration:g}s.")
 
     def stop(self, reason="Operator STOP", *, error=False):
         # No inference lock, model wait, network operation, or torque write here.
@@ -213,10 +208,16 @@ class Execution:
     @staticmethod
     def _feedback_problem(state):
         """Name the actual blocker instead of a combined fault/stale message."""
-        reasons = [state["error"], state["motor_error"]]
+        reasons = [state["motor_error"], state["error"], state.get("camera_error")]
+        for name, live in state["camera_live"].items():
+            if not live:
+                age = state["camera_age_ms"].get(name)
+                detail = f"last advance {age} ms ago" if age is not None else "no frame"
+                reasons.append(f"{name.capitalize()} camera feed unavailable ({detail})")
         if not state["live"]:
             age = state["observation_age_ms"]
-            reasons.append(f"Observation stale ({age} ms old)" if age is not None else "No camera observation received")
+            reasons.append(f"Last valid model input is {age} ms old" if age is not None
+                           else "Waiting for synchronized camera and Follower input")
         if state["camera_count"] != 2:
             reasons.append(f"Camera inputs: {state['camera_count']}/2")
         if not state["ranges_valid"]:
@@ -232,6 +233,21 @@ class Execution:
             if motor["status"] == "stale":
                 reasons.append(f"J{motor['id']} feedback stale ({motor['age_ms']} ms old)")
         return "; ".join(dict.fromkeys(reason for reason in reasons if reason)) or "Follower feedback is unavailable"
+
+    async def _wait_for_live_feedback(self, cancel):
+        with self.lock:
+            self.data["stage"] = "Waiting for live feedback"
+        deadline = time.monotonic() + 3
+        while True:
+            self._check(cancel)
+            feedback = self.station.snapshot()
+            if feedback["preview_ready"]:
+                return
+            motor_fault = any(m["error_kind"] or any(m["servo_errors"]) or m["status"] == "fault"
+                              for m in feedback["motors"])
+            if motor_fault or time.monotonic() >= deadline:
+                raise RuntimeError(self._feedback_problem(feedback))
+            await asyncio.sleep(.05)
 
     def _thread(self, prompt, cancel):
         asyncio.run(self._run(prompt, cancel))
@@ -272,16 +288,6 @@ class Execution:
             if self.deadline is not None and time.monotonic() >= self.deadline:
                 self.stop(f"Run duration limit reached ({self.duration:g}s)")
                 return
-            problem = self._hand_problem()
-            if problem:
-                self.stop(problem, error=True)
-                return
-            if self.mapping is not None:
-                try:
-                    self.mapping.assert_current()
-                except AlignmentError as exc:
-                    self.stop(str(exc), error=True)
-                    return
             # Interpretation, loading, and waiting for input cannot issue motor commands.
             # Start the hardware watchdog when preparation is about to begin.
             if self.run_started is None:
@@ -291,9 +297,10 @@ class Execution:
             if not state["preview_ready"]:
                 self.stop(self._feedback_problem(state), error=True)
                 return
-            problem = self.vision.current_problem()
-            if problem:
-                self.stop(problem, error=True)
+            try:
+                self._check_positioning()
+            except (AlignmentError, VisionError) as exc:
+                self.stop(str(exc), error=True)
                 return
             if self.client and (not self.client.connected or not self.client.setup_done):
                 self.stop("Station connection lost", error=True)
@@ -305,28 +312,54 @@ class Execution:
             self.stop(f"Run duration limit reached ({self.duration:g}s)")
         if cancel.is_set():
             raise asyncio.CancelledError()
-        if self.mapping is not None:
-            self.mapping.assert_current()
-        problem = self._hand_problem()
-        if problem:
-            raise RuntimeError(problem)
+        if self.run_started is not None:
+            self._check_positioning()
         if FOLLOWER == LEADER:
             raise RuntimeError("Follower must be distinct from Leader.")
+
+    def _check_positioning(self):
+        if self.mapping is not None:
+            self.mapping.assert_current()
+            problem = self.vision.current_problem()
+            if problem:
+                raise VisionError(problem)
+
+    def _use_direct_vla(self, exc):
+        reason = str(exc)[:350].rstrip(".") or type(exc).__name__
+        with self.lock:
+            self.mapping = None
+            self.execution_mode = "direct_vla"
+            self.data.update(execution_mode=self.execution_mode, mode_reason=reason, approach=None)
+        self.log("info", f"Skipping tabletop approach. Direct SmolVLA selected. {reason}.")
+
+    async def _locate_object(self, jpeg, frame_id, visual, cancel):
+        loop = asyncio.get_running_loop()
+        if self.mapping is not None:
+            try:
+                self._check_positioning()
+                result = await loop.run_in_executor(self.pool, self.vision.detect, jpeg, frame_id, visual)
+                self._check_positioning()
+                return result
+            except (AlignmentError, VisionError) as exc:
+                self._check(cancel)
+                self._use_direct_vla(exc)
+        # This still checks target confidence on the actual image.
+        return await loop.run_in_executor(self.pool, self.vision.detect_pixels, jpeg, frame_id, visual)
 
     async def _send(self, command, cancel):
         # This check follows inference and immediately precedes enqueueing a write.
         async def send():
             self._check(cancel)
             if not self.movement_ready:
-                raise RuntimeError("Calibration, detection, and verified safe approach planning must finish before motor commands.")
-            problem = self.vision.current_problem()
+                raise RuntimeError("Execution preflight must finish before motor commands.")
+            problem = self.vision.current_problem() if self.mapping is not None else None
             if problem:
                 raise VisionError(problem)
             feedback = self.station.snapshot()
             if not feedback["preview_ready"]:
                 raise RuntimeError(self._feedback_problem(feedback))
-            if self.mapping and [(j["range_min"], j["range_max"]) for j in feedback["joints"]] != self.mapping.ranges:
-                raise AlignmentError("Servo calibration changed after robot alignment was checked.")
+            if self.motion_ranges is not None and [(j["range_min"], j["range_max"]) for j in feedback["joints"]] != self.motion_ranges:
+                raise AlignmentError("Servo calibration changed after execution preflight.")
             await self.rp.send_commands(self.client, [command])
         started = time.perf_counter()
         with self.lock:
@@ -423,10 +456,11 @@ class Execution:
                 jpeg, snapshot = self.station.capture_workspace()
                 if snapshot["frame_id"] != after:
                     return jpeg, snapshot
-            except RuntimeError:
-                pass
+                reason = "Waiting for a new workspace frame."
+            except RuntimeError as exc:
+                reason = str(exc)
             if time.monotonic() >= end:
-                raise VisionError("Workspace camera did not deliver a fresh image within 3 seconds.")
+                raise VisionError(f"Workspace camera did not deliver a fresh image within 3 seconds. {reason}")
             await asyncio.sleep(.05)
 
     async def _calibrate(self, cancel):
@@ -458,7 +492,7 @@ class Execution:
     def _interpret_scene(self, prompt, jpeg, frame_id, cancel):
         cancelled(cancel)
         metadata = {"frame_id": frame_id, "sha256": hashlib.sha256(jpeg).hexdigest(),
-                    "attached": False, "interpreted": False}
+                    "attached": False, "interpreted": False, "captured_at": time.time()}
         try:
             metadata["attached"] = bool(self.interpreter.image_supported and not self.interpreter.error)
             result = self.interpreter.interpret_image(prompt, jpeg, cancel)
@@ -466,9 +500,10 @@ class Execution:
             return result["intent"], result["visual"], metadata
         except Exception as exc:
             cancelled(cancel)
-            intent = blue_fallback_intent(prompt)
             metadata["reason"] = str(exc)[:300]
-            self.log("warning", f"OpenCV blue-object fallback: Codex image interpretation unavailable ({str(exc)[:200]}). This detection is not attributed to Codex.")
+            self.log("warning", f"Codex image interpretation unavailable: {str(exc)[:200]}")
+            intent = blue_fallback_intent(prompt)
+            self.log("warning", "Using OpenCV blue-block fallback.")
             return intent, None, metadata
 
     async def _approach(self, plan, cancel):
@@ -536,13 +571,31 @@ class Execution:
         self.log("info", f"Safe approach reached: table TCP {actual.round(1).tolist()}mm. Handing current live observations to SmolVLA; this handoff state was not separately trained.")
 
     async def _execute(self, prompt, cancel):
-        self._check(cancel)
-        calibrated = await self._calibrate(cancel)
-        jpeg, image_snapshot = await self._fresh_workspace(cancel, calibrated["frame_id"])
+        # Fail quickly on unavailable hardware before invoking Codex or loading the model.
+        await self._wait_for_live_feedback(cancel)
+        calibrated = None
+        try:
+            if not (MANUAL_CALIBRATION.is_file() or CAMERA_CALIBRATION.is_file()):
+                raise AlignmentError("No saved camera homography.")
+            calibrated = await self._calibrate(cancel)
+            with self.lock:
+                self.data.update(stage="Checking robot alignment", owner="Setup")
+            initial_feedback = self.station.snapshot()
+            self.mapping = await asyncio.get_running_loop().run_in_executor(
+                self.pool, load_mapping, self.vision, initial_feedback, self.safe_height)
+            self._check(cancel)
+            self._check_positioning()
+            if getattr(self.mapping, "taught", False) and initial_feedback["preview_ready"]:
+                self.mapping.start_point([joint["pos"] for joint in initial_feedback["joints"]])
+        except Exception as exc:
+            # Fallback is chosen only during preflight, before any motor write.
+            self._check(cancel)
+            self._use_direct_vla(exc)
+        jpeg, image_snapshot = await self._fresh_workspace(cancel, calibrated["frame_id"] if calibrated else None)
         with self.lock:
             self.data.update(stage="Detecting object", owner="Vision")
         started = time.perf_counter()
-        self.log("info", f"Captured workspace frame {image_snapshot['frame_id']} for Codex image interpretation and OpenCV refinement.")
+        self.log("info", f"Captured workspace frame {image_snapshot['frame_id']} for Codex object localization. Codex pixel coordinates are primary; OpenCV is a fallback only.")
         try:
             intent, visual, image_input = await asyncio.get_running_loop().run_in_executor(
                 self.pool, self._interpret_scene, prompt, jpeg, image_snapshot["frame_id"], cancel)
@@ -552,76 +605,96 @@ class Execution:
         self._check(cancel)
         with self.lock:
             self.data.update(image_input=image_input,
-                             interpretation_source="Codex vision + OpenCV" if image_input["interpreted"] else "OpenCV")
+                             interpretation_source="Codex vision" if image_input["interpreted"] else "OpenCV fallback")
         task = build_task(intent, prompt)
         if task["task_type"] != "pick_up" or task["target"]["color"] != "blue":
             with self.lock:
                 self.data["interpretation"] = task
             raise TaskError("This automatic-picking demonstration supports a single blue-block pickup only.")
-        # Execute is the deliberate authorization for this accepted task.
         task.update(requires_operator_approval=False, execution_enabled=True)
         instruction = policy_instruction(task)
-        detection = await asyncio.get_running_loop().run_in_executor(
-            self.pool, self.vision.detect, jpeg, image_snapshot["frame_id"], visual)
+        detection = await self._locate_object(jpeg, image_snapshot["frame_id"], visual, cancel)
+        with self.vision.lock:
+            detection.update(object=f"{task['target']['color']} {task['target']['object']}",
+                             captured_at=image_input["captured_at"])
         self._check(cancel)
         with self.lock:
             self.data.update(interpretation=task, prompt=instruction, owner="SmolVLA",
                              detection=detection, image_input=image_input,
-                             interpretation_source="Codex vision + OpenCV" if image_input["interpreted"] else "OpenCV",
-                             stage="Checking robot alignment")
-        self.log("info", f"Detected {detection['object']} via {detection['source']}: pixel {detection['pixel']}, tabletop {detection['table_mm']}mm; score {detection['confidence']:.2f}.")
-        # Mapping validation precedes model load, torque changes, or any writes.
-        initial = self.station.snapshot()
-        self.mapping = await asyncio.get_running_loop().run_in_executor(
-            self.pool, load_mapping, self.vision, initial, self.safe_height)
-        with self.lock:
-            self.data["stage"] = "Loading model" if self.model is None else "Planning safe approach"
+                             interpretation_source="Codex vision" if image_input["interpreted"] else "OpenCV fallback",
+                             stage="Loading model" if self.model is None else "Waiting for live feedback")
+        coordinates = f"tabletop {detection['table_mm']}mm" if detection["table_mm"] is not None else "pixels only; no homography needed"
+        self.log("info", f"Detected {detection['object']} via {detection['source']}: pixel {detection['pixel']}, {coordinates}; score {detection['confidence']:.2f}.")
         await asyncio.get_running_loop().run_in_executor(self.pool, self._load)
-        self._check(cancel)
-        with self.lock:
-            if not cancel.is_set():
-                self.data["stage"] = "Waiting for live feedback"
-        # Model initialization can briefly starve observation polling. No motor
-        # writes are permitted until the reader has caught up and is healthy.
-        fresh_deadline = time.monotonic() + 3
-        while True:
-            self._check(cancel)
-            feedback = self.station.snapshot()
-            if feedback["preview_ready"]:
-                break
-            motor_fault = any(m["error_kind"] or any(m["servo_errors"]) or m["status"] == "fault"
-                              for m in feedback["motors"])
-            if motor_fault or time.monotonic() >= fresh_deadline:
-                raise RuntimeError(self._feedback_problem(feedback))
-            await asyncio.sleep(.05)
-        # Refuse stale targets after Codex/model latency; do not chase a moved block.
+        # A short camera gap during model loading can recover before any motion.
+        await self._wait_for_live_feedback(cancel)
         latest_jpeg, latest_image = await self._fresh_workspace(cancel)
-        current_detection = await asyncio.get_running_loop().run_in_executor(
-            self.pool, self.vision.detect, latest_jpeg, latest_image["frame_id"])
-        moved = math.hypot(current_detection["table_mm"]["x"] - detection["table_mm"]["x"],
-                           current_detection["table_mm"]["y"] - detection["table_mm"]["y"])
-        if moved > 5:
-            raise VisionError(f"Object moved {moved:.1f}mm while interpreting/loading. Retry with the object stationary.")
-        current_detection["source"] = detection["source"]
+        if image_input["interpreted"] and self.mapping is None:
+            # Direct VLA consumes live observations, not a frozen pixel target.
+            # Keep the original Codex frame/coordinates honestly labelled as a
+            # snapshot instead of requiring a second HSV colour-mask detection.
+            current_detection = dict(detection)
+            self.log("info", "Direct VLA uses current camera observations. Codex coordinates remain labelled with their original captured frame; OpenCV confirmation is not required.")
+        else:
+            fresh_visual = None
+            if image_input["interpreted"]:
+                self.log("info", f"Refreshing Codex coordinates from frame {latest_image['frame_id']} before the tabletop approach.")
+                refresh_started = time.perf_counter()
+                fresh_intent, fresh_visual, image_input = await asyncio.get_running_loop().run_in_executor(
+                    self.pool, self._interpret_scene, prompt, latest_jpeg, latest_image["frame_id"], cancel)
+                self._check(cancel)
+                refreshed_task = build_task(fresh_intent, prompt)
+                if refreshed_task["task_type"] != "pick_up" or refreshed_task["target"]["color"] != "blue":
+                    raise TaskError("Codex did not confirm the blue-object pickup in the refreshed camera image.")
+                with self.lock:
+                    self.data["interpretation_ms"] += round((time.perf_counter()-refresh_started)*1000, 1)
+            current_detection = await self._locate_object(latest_jpeg, latest_image["frame_id"], fresh_visual, cancel)
+            with self.vision.lock:
+                current_detection["object"] = detection["object"]
+                if image_input["interpreted"]:
+                    current_detection["captured_at"] = image_input["captured_at"]
         _, feedback = self.station.capture()
         current_raw = [j["pos"] for j in feedback["joints"]]
-        with self.lock:
-            self.data["stage"] = "Planning safe approach"
-        xy = [current_detection["table_mm"][key] for key in ("x", "y")]
-        plan = await asyncio.get_running_loop().run_in_executor(self.pool, self.mapping.plan, xy, current_raw, cancel)
+        plan = None
+        if self.mapping is not None:
+            try:
+                x, y = (current_detection["table_mm"][axis] for axis in ("x", "y"))
+                first = detection["table_mm"]
+                moved = math.hypot(x - first["x"], y - first["y"])
+                if moved > 5:
+                    raise VisionError(f"Tabletop target estimate shifted {moved:.1f}mm during preflight.")
+                with self.lock:
+                    self.data["stage"] = "Planning safe approach"
+                plan = await asyncio.get_running_loop().run_in_executor(self.pool, self.mapping.plan, (x, y), current_raw, cancel)
+                self._check_positioning()
+            except (AlignmentError, VisionError) as exc:
+                self._check(cancel)
+                plan = None
+                self._use_direct_vla(exc)
+                current_detection = dict(current_detection, table_mm=None,
+                                         position_note="Direct VLA uses live camera observations.")
+                with self.vision.lock:
+                    self.vision.data["detection"] = current_detection
+                _, feedback = self.station.capture()
+            else:
+                with self.lock:
+                    self.execution_mode = "positioned_vla"
+                    self.data.update(execution_mode=self.execution_mode, mode_reason="Validated tabletop approach.")
+                self.log("info", "Positioning + SmolVLA selected. Tabletop approach validated.")
         self._check(cancel)
         with self.lock:
-            self.data.update(approach={key: value for key, value in plan.items() if key != "waypoints"}, detection=current_detection)
-            self.data["approach"]["waypoint_count"] = len(plan["waypoints"])
+            self.data.update(detection=current_detection, image_input=image_input,
+                             interpretation_source="Codex vision" if current_detection["source"] == "codex" else "OpenCV fallback",
+                             approach={key: value for key, value in plan.items() if key != "waypoints"} if plan else None)
+            if plan:
+                self.data["approach"]["waypoint_count"] = len(plan["waypoints"])
+            self.motion_ranges = [(j["range_min"], j["range_max"]) for j in feedback["joints"]]
             self.movement_ready = True
-        with self.lock:
             self.run_started = time.monotonic()
             self.deadline = self.run_started + self.duration
-            if not cancel.is_set():
-                self.data["stage"] = "Preparing follower"
+            self.data["stage"] = "Preparing follower"
         from station_py.client import Client
         client = Client(STATION, logging.getLogger("mission-execution"))
-        # Wait before exposing it to the connection watchdog.
         try:
             await client.wait_ready(timeout=2)
         except BaseException:
@@ -629,13 +702,14 @@ class Execution:
             raise
         self.client = client
         await self._prepare(cancel)
-        _, prepared = self.station.capture()
-        if max(abs(j["pos"] - expected) for j, expected in zip(prepared["joints"], current_raw)) > 10:
-            raise AlignmentError("Robot moved after safe-path planning; retry from a stable, verified safe start pose.")
-        await self._approach(plan, cancel)
+        if plan is not None:
+            _, prepared = self.station.capture()
+            if max(abs(j["pos"] - expected) for j, expected in zip(prepared["joints"], current_raw)) > 10:
+                raise AlignmentError("Robot moved after safe-path planning; retry from a stable, verified safe start pose.")
+            await self._approach(plan, cancel)
         with self.lock:
             self.data.update(stage="Running VLA", owner="SmolVLA", vla_step_limit=min(self.max_delta_ticks, HANDOFF_MAX_STEP_TICKS))
-        vla_deadline = min(self.deadline, time.monotonic() + HANDOFF_SECONDS)
+        vla_deadline = min(self.deadline, time.monotonic() + HANDOFF_SECONDS) if self.mapping is not None else self.deadline
         last_id = None
         while True:
             if time.monotonic() >= vla_deadline:
@@ -678,7 +752,8 @@ class Execution:
             if self._follower_mirrored(await self._mirroring()):
                 raise RuntimeError("Follower mirroring was re-enabled during execution.")
             raw_goals = self._raw_goals(goals, latest, min(self.max_delta_ticks, HANDOFF_MAX_STEP_TICKS))
-            self.mapping.check_segment([j["pos"] for j in latest["joints"]], raw_goals, approach=False)
+            if self.mapping is not None:
+                self.mapping.check_segment([j["pos"] for j in latest["joints"]], raw_goals, approach=False)
             requested = [round(j["range_min"] + g * (j["range_max"] - j["range_min"]))
                          for g, j in zip(goals, latest["joints"])]
             await self._send(self.rp.build_sync_write_command(FOLLOWER, list(MOTOR_IDS), raw_goals), cancel)
@@ -700,7 +775,7 @@ class Execution:
             self.log("info", f"Action {count}: Follower goals {raw_goals}{suffix}")
         self._check(cancel)
         _, final_feedback = self.station.capture()
-        tcp = None if getattr(self.mapping, "taught", False) else self.mapping.pose([j["pos"] for j in final_feedback["joints"]])[:3, 3].tolist()
+        tcp = None if self.mapping is None or getattr(self.mapping, "taught", False) else self.mapping.pose([j["pos"] for j in final_feedback["joints"]])[:3, 3].tolist()
         with self.lock:
             self.run_finished = time.monotonic()
             self.data.update(state="FINISHED", stage="Finished — verify grasp", owner=None,

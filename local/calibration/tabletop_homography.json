@@ -1,30 +1,30 @@
 {
   "method": "manual_four_point",
   "units": "mm",
-  "camera_source": "localhost:8888//ea6667e163757ccdd7a4d41f02cdc297eadd6bb0545ebfafb58f88e12a32654b/usbvideo/9fa2b3df266f921527daa77304a71ccb",
-  "camera_queue": "/ea6667e163757ccdd7a4d41f02cdc297eadd6bb0545ebfafb58f88e12a32654b/usbvideo/9fa2b3df266f921527daa77304a71ccb",
-  "camera_unique_id": "11391:19040:3:53",
+  "camera_source": "localhost:8888//ea6667e163757ccdd7a4d41f02cdc297eadd6bb0545ebfafb58f88e12a32654b/usbvideo/0e69efcd982a1aae94c931793df91b77",
+  "camera_queue": "/ea6667e163757ccdd7a4d41f02cdc297eadd6bb0545ebfafb58f88e12a32654b/usbvideo/0e69efcd982a1aae94c931793df91b77",
+  "camera_unique_id": "11391:19040:3:114",
   "image_size": [
     299,
     224
   ],
-  "frame_id": "13320c00",
+  "frame_id": "365b",
   "pixel_points": [
     [
-      95.92916666666666,
-      91.85391177891084
+      93.61547619047619,
+      90.11492979308083
     ],
     [
-      148.565625,
-      113.03299929485387
+      147.7202380952381,
+      112.18389573841144
     ],
     [
-      123.02604166666667,
-      148.85057377034573
+      122.09166666666667,
+      149.20280635638537
     ],
     [
-      65.40625,
-      119.88505702060013
+      64.42738095238096,
+      117.87911275656128
     ]
   ],
   "table_points_mm": [
@@ -47,50 +47,39 @@
   ],
   "image_to_table": [
     [
-      -3.6178634991806664,
-      8.091994133640481,
-      -552.6832085581472
+      -4.505847316028696,
+      9.631314843361512,
+      -632.2035926201854
     ],
     [
-      7.175596205261929,
-      8.1607074200593,
-      -1375.3576723739577
+      8.747994415225255,
+      9.581771439099898,
+      -1607.9701820614512
     ],
     [
-      0.00011702511416717452,
-      0.011702432755478104,
+      0.0017223735389548652,
+      0.014648305843217878,
       1.0
     ]
   ],
   "table_to_image": [
     [
-      -0.1256752442854058,
-      0.07543773336696041,
-      34.295268124762885
+      -0.10016480384915279,
+      0.057107887060669466,
+      28.503230706558913
     ],
     [
-      0.038012548100344004,
-      0.018409972807888045,
-      46.32919439909378
+      0.03481581064844203,
+      0.010328969794520452,
+      38.61935601293142
     ],
     [
-      -0.00043013212819816536,
-      -0.0002242695781742717,
-      0.45382231026143793
+      -0.0003374714348735553,
+      -0.00024966302213441486,
+      0.38519865131076214
     ]
   ],
-  "max_reprojection_error_mm": 1.3791594178559996e-05,
-  "robot_base_alignment": {
-    "table_xy_mm": [-180.0, 190.0],
-    "yaw_deg": 0.0,
-    "height_above_table_mm": 35.0,
-    "pixel": null,
-    "camera_unique_id": "11391:19040:3:53",
-    "homography_saved_at": 1795323672.9282553,
-    "level_and_fixed": true,
-    "verified": false,
-    "note": "Coordinate transform saved from operator-provided values; robot kinematics and servo calibration remain prerequisites for motion."
-  },
-  "saved_at": 1795323672.9282553,
+  "max_reprojection_error_mm": 2.7134791819024012e-05,
+  "saved_at": 1795358386.912758,
   "output_path": "local/calibration/tabletop_homography.json"
 }

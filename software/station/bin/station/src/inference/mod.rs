@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use normfs::UintN;
 use crate::station_proto::inference::{InferenceRx, inference_rx};
 use crate::station_proto::startups::StationStartup;
+use usbvideo::usbvideo_proto::usbvideo::{RxEnvelope, RxEnvelopeType};
 
 const QUEUE_ID: &str = "inference-states";
 const STARTUPS_QUEUE_ID: &str = "startups";
@@ -155,8 +156,20 @@ impl Inference {
         log::info!("Inference: registering queue '{}' with type {}", queue_id, queue_data_type);
 
         let callback = Box::new(move |entries: &[(UintN, Bytes)]| {
-            if let Some((id, _bytes)) = entries.last() {
-                latest_pointers.insert(queue_path.clone(), (id.clone(), queue_data_type));
+            if let Some((id, data)) = entries.last() {
+                // Replugging creates a new queue. Retaining a terminal envelope
+                // from the old queue prevents normvla from ever publishing again.
+                let retired_camera = queue_data_type
+                    == crate::station_proto::drivers::QueueDataType::QdtUsbVideoFrames as i32
+                    && RxEnvelope::decode(data.as_ref()).map(|envelope| {
+                        matches!(RxEnvelopeType::try_from(envelope.r#type),
+                            Ok(RxEnvelopeType::EtDeviceDisconnected | RxEnvelopeType::EtDeviceRecordingEnd))
+                    }).unwrap_or(false);
+                if retired_camera {
+                    latest_pointers.remove(&queue_path);
+                } else {
+                    latest_pointers.insert(queue_path.clone(), (id.clone(), queue_data_type));
+                }
 
                 // Signal worker thread to rebuild and publish
                 let (lock, cvar) = &*signal;

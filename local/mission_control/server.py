@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from .config import (HERE, ROOT, CHECKPOINT, CHECKPOINT_LABEL, VLA_PYTHON,
-                     EPISODE_STATE, EPISODE_URL, FOLLOWER, LEADER, STATION, CAMERAS,
+                     EPISODE_STATE, EPISODE_URL, FOLLOWER, LEADER, STATION, CAMERAS, POLICY_CAMERAS,
                      DEFAULT_RUN_SECONDS, DEFAULT_MAX_DELTA_TICKS,
                      MAX_RUN_SECONDS, MAX_DELTA_TICKS_LIMIT, REQUESTED_SAFE_HEIGHT_MM)
 from .interpreter import Interpreter
@@ -44,7 +44,7 @@ class MissionControl:
         self.execution = Execution(self.station, self.log, self.lock, duration=run_seconds,
                                    max_delta_ticks=max_delta_ticks, mock=mock, interpreter=self.interpreter,
                                    safe_height=safe_height)
-        self.log("info", "Session started. Execute calibrates the camera, detects the blue block, checks robot alignment, approaches at safe height, then hands off to SmolVLA.")
+        self.log("info", "Session started. Execute uses positioning + VLA when setup is valid, otherwise direct VLA. Both routes require live cameras, calibrated motor limits and disabled mirroring. Hand alerts are warning-only and never trigger STOP.")
         if mock:
             self.log("warning", "SIMULATION: cameras, telemetry, interpretation and predictions are synthetic.")
 
@@ -125,6 +125,13 @@ class MissionControl:
             raise TaskError("STOP accepts an empty JSON object.")
         self.execution.stop()
 
+    def select_workspace_camera(self, payload):
+        if set(payload) != {"camera_unique_id"} or not isinstance(payload["camera_unique_id"], str):
+            raise ValueError("Select a workspace camera from the available feeds.")
+        self.execution.stop("Workspace camera selection changed; check the view, then click Execute to restart")
+        self.station.select_workspace_camera(payload["camera_unique_id"])
+        self.log("info", f"Workspace camera selected: {payload['camera_unique_id']}. Saved homography was not modified.")
+
     def episode_lab(self):
         try:
             state = json.loads(EPISODE_STATE.read_text())
@@ -179,8 +186,8 @@ class MissionControl:
             return {"phase": 2, "mode": "simulation" if self.mock else "execution", "csrf_token": self.token,
                     "server_time": time.time(),
                     "config": {"station": STATION, "follower": FOLLOWER, "leader": LEADER,
-                               "checkpoint": CHECKPOINT_LABEL, "camera_mapping": CAMERAS,
-                               "camera_mapping_verified": False,
+                               "checkpoint": CHECKPOINT_LABEL, "camera_mapping": CAMERAS if self.mock else POLICY_CAMERAS,
+                               "camera_mapping_verified": station.get("camera_mapping_verified", False),
                                "checkpoint_available": self.mock or all((CHECKPOINT / name).is_file()
                                    for name in ("config.json", "model.safetensors", "stats.safetensors")),
                                "vla_python_available": self.mock or VLA_PYTHON.is_file(),
@@ -291,6 +298,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/stop":
                 self.server.app.stop(payload)
                 return self._send(200, {"accepted": True, "message": "Execution cancelled. No new motor commands; torque unchanged."})
+            if path == "/api/workspace-camera":
+                self.server.app.select_workspace_camera(payload)
+                return self._send(200, {"accepted": True, "message": "Camera selection saved; execution remains stopped."})
             if path in ("/api/approve", "/api/pause", "/api/move", "/api/teleop"):
                 return self._send(403, {"error": "Use Execute or STOP. Other motor-control routes are unavailable."})
             if path == "/api/interpret": self.server.app.interpret(payload)

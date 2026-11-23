@@ -18,12 +18,18 @@ CHECKPOINT_LABEL = str(CHECKPOINT.relative_to(ROOT))
 EPISODE_STATE = ROOT / "local/episode_dashboard_state.json"
 EPISODE_URL = "http://127.0.0.1:8891"
 FRESH_SECONDS = 2.0
-# station_mcp.observe documents cam0=wrist, cam1=overhead. Verify on hardware.
+# Legacy camera list order for unassigned previews and calibration.
 CAMERAS = {"workspace": 1, "wrist": 0}
+# All five episodes used for this checkpoint have this model input order.
+POLICY_CAMERAS = {"workspace": 0, "wrist": 1}
+# Workspace identity is independent of whether the homography is usable.
+WORKSPACE_CAMERA_ID = "11391:19040:3:53"
+CAMERA_SOURCE = ROOT / "local/calibration/camera_source.json"
 BENCH_MAT = HERE / "bench_mat.json"
 CAMERA_CALIBRATION = HERE / "runtime/workspace_homography.json"
 MANUAL_CALIBRATION = ROOT / "local/calibration/tabletop_homography.json"
 TAUGHT_POINTS = MANUAL_CALIBRATION.with_name("robot_taught_points.json")
+TAUGHT_POINT_COUNT = 6
 TAUGHT_START_TOLERANCE_TICKS = 20
 TAUGHT_VLA_MAX_OFFSET_TICKS = 500
 ROBOT_ALIGNMENT = HERE / "robot_alignment.json"

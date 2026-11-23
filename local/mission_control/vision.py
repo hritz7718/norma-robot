@@ -37,6 +37,12 @@ class Vision:
             result["last_verified_age_ms"] = None if self.last_verified is None else round((time.monotonic() - self.last_verified) * 1000)
             return result
 
+    def reset(self, reason=None):
+        with self.lock:
+            self.layout = self.record = self.overlay = self.last_verified = None
+            self.data.update(calibration="NOT CALIBRATED", reason=reason, detection=None,
+                             calibration_details=None, overlay_frame_id=None, marker_ids=[], marker_corners={})
+
     def _imports(self):
         if self.cv is None:
             try:
@@ -348,30 +354,81 @@ class Vision:
             actual = self.np.array([self.marker_centre(found[mid]) for mid in sorted(layout["centres"])])
             if self.np.linalg.norm(predicted - actual, axis=1).max() > 3:
                 raise VisionError("Camera/Bench Mat moved since calibration. Recalibrate before detecting a target.")
-        bbox = None
-        if visual is not None:
-            if visual["detected"] is not True or visual["confidence"] < .6:
-                raise VisionError("Codex did not identify the requested object confidently in the attached image.")
-            box = visual["bbox"]
-            x0, y0, x1, y1 = [box[key] for key in ("x0", "y0", "x1", "y1")]
-            height, width = image.shape[:2]
-            if not 0 <= x0 < x1 <= width or not 0 <= y0 < y1 <= height:
-                raise VisionError("Codex bounding box is outside the actual captured image.")
-            padding = max(4, round(max(x1 - x0, y1 - y0) * .15))
-            bbox = [max(0, x0 - padding), max(0, y0 - padding), min(width, x1 + padding), min(height, y1 + padding)]
-        candidate = self._blue(image, found, bbox)
+        candidate = self._locate_blue(image, found, visual)
         u, v = candidate["pixel"]["u"], candidate["pixel"]["v"]
         x, y = self.project([[u, v]], record["image_to_table"])[0]
         # The printed references establish coordinates, not the task boundary.
         # Reachability and workspace limits are checked by the robot mapping.
-        candidate.update(object="blue block", detected=True, table_mm={"x": float(x), "y": float(y)},
-                         source="codex+opencv" if visual is not None else "opencv", frame_id=frame_id,
+        candidate.update(object="blue object", detected=True, table_mm={"x": float(x), "y": float(y)},
+                         frame_id=frame_id,
                          captured_at=time.time(), position_note="Approximate tabletop projection; visible centroid may be above the table.")
         candidate.pop("area", None)
         with self.lock:
             self.data["detection"] = candidate
         self.observe(jpeg, frame_id)
         return candidate
+
+    def _locate_blue(self, image, found, visual):
+        height, width = image.shape[:2]
+        if visual is None:
+            candidate = self._blue(image, found)
+            candidate.update(source="opencv", image_size=[width, height])
+            return candidate
+        if visual["detected"] is not True or visual["confidence"] < .6:
+            raise VisionError("Codex did not identify the requested object confidently in the attached image.")
+        box = visual["bbox"]
+        x0, y0, x1, y1 = [box[key] for key in ("x0", "y0", "x1", "y1")]
+        if not 0 <= x0 < x1 <= width or not 0 <= y0 < y1 <= height:
+            raise VisionError("Codex bounding box is outside the actual captured image.")
+        return {"pixel": {"u": (x0+x1)/2, "v": (y0+y1)/2}, "bbox": [x0,y0,x1,y1],
+                "confidence": visual["confidence"], "source": "codex", "image_size": [width, height],
+                "localization": "Approximate centre of Codex's bounding box"}
+
+    def detect_pixels(self, jpeg, frame_id, visual=None):
+        image = self.decode(jpeg)
+        candidate = self._locate_blue(image, {}, visual)
+        candidate.update(object="blue object", detected=True, table_mm=None,
+                         frame_id=frame_id,
+                         captured_at=time.time(), position_note="Image pixels only; direct VLA uses live observations without tabletop positioning.")
+        candidate.pop("area", None)
+        with self.lock:
+            self.data["detection"] = candidate
+        self.observe_pixels(jpeg, frame_id)
+        return candidate
+
+    def _draw_detection(self, image, found):
+        cv = self.cv
+        with self.lock:
+            detected = copy.deepcopy(self.data["detection"])
+        if not detected:
+            return
+        if detected["source"] == "codex":
+            if detected.get("image_size") != [image.shape[1], image.shape[0]]:
+                return
+            age = max(0, time.time()-detected["captured_at"])
+            label = f"Codex last result {age:.0f}s"
+        else:
+            try:
+                detected = self._blue(image, found)
+            except VisionError:
+                return
+            label = "OpenCV fallback"
+        x0, y0, x1, y1 = detected["bbox"]
+        u, v = detected["pixel"]["u"], detected["pixel"]["v"]
+        cv.rectangle(image, (x0, y0), (x1, y1), (255, 160, 0), 1)
+        cv.drawMarker(image, (round(u), round(v)), (255, 180, 0), cv.MARKER_CROSS, 9, 1)
+        cv.putText(image, f"{label} {u:.0f},{v:.0f}px", (max(0, x0), max(10, y0-4)), cv.FONT_HERSHEY_SIMPLEX, .3, (255, 200, 0), 1)
+
+    def observe_pixels(self, jpeg, frame_id):
+        image = self.decode(jpeg)
+        cv = self.cv
+        self._draw_detection(image, {})
+        ok, encoded = cv.imencode(".jpg", image)
+        if not ok:
+            raise VisionError("Workspace object overlay could not be encoded.")
+        with self.lock:
+            self.overlay = encoded.tobytes()
+            self.data["overlay_frame_id"] = frame_id
 
     def current_problem(self):
         with self.lock:
@@ -441,18 +498,19 @@ class Vision:
             for index, label, color in ((1, "X", (0, 0, 255)), (2, "Y", (0, 220, 0))):
                 cv.arrowedLine(image, tuple(axes[0]), tuple(axes[index]), color, 1)
                 cv.putText(image, label, tuple(axes[index]), cv.FONT_HERSHEY_SIMPLEX, .4, color, 1)
-            # Detect against unannotated pixels; overlays must not become objects.
+            # Localize fallback objects on original pixels, before drawing axes.
             original = self.decode(jpeg)
-            try:
-                blue = self._blue(original, found)
-                u, v = blue["pixel"]["u"], blue["pixel"]["v"]
-                xy = self.project([[u, v]], record["image_to_table"])[0]
-                x0, y0, x1, y1 = blue["bbox"]
-                cv.rectangle(image, (x0, y0), (x1, y1), (255, 160, 0), 1)
-                cv.drawMarker(image, (round(u), round(v)), (255, 180, 0), cv.MARKER_CROSS, 9, 1)
-                cv.putText(image, f"blue {xy[0]:.0f},{xy[1]:.0f}mm", (max(0, x0), max(10, y0 - 4)), cv.FONT_HERSHEY_SIMPLEX, .35, (255, 200, 0), 1)
-            except VisionError:
-                pass
+            with self.lock:
+                detection = copy.deepcopy(self.data["detection"])
+            if detection and detection["source"] == "opencv":
+                try:
+                    blue = self._blue(original, found)
+                    x0,y0,x1,y1 = blue["bbox"]
+                    cv.rectangle(image, (x0,y0), (x1,y1), (255,160,0), 1)
+                except VisionError:
+                    pass
+            elif detection:
+                self._draw_detection(image, found)
             gripper = layout.get("gripper_marker_id")
             if gripper is not None and int(gripper) in found:
                 centre = self.marker_centre(found[int(gripper)]).astype(int)
@@ -470,4 +528,4 @@ class Vision:
 
     def camera(self, frame_id):
         with self.lock:
-            return self.overlay if self.data["calibration"] == "CALIBRATION SUCCESSFUL" and self.data["overlay_frame_id"] == frame_id else None
+            return self.overlay if self.data["overlay_frame_id"] == frame_id and (self.record is None or self.data["calibration"] == "CALIBRATION SUCCESSFUL") else None

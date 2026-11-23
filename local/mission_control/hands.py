@@ -1,4 +1,4 @@
-"""MediaPipe workspace monitoring. Software STOP only; never writes to Station."""
+"""MediaPipe workspace warnings and overlays; never stops or commands the robot."""
 import copy
 import math
 import threading
@@ -13,14 +13,14 @@ CONNECTIONS = ((0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
 
 
 class HandMonitor:
-    def __init__(self, on_trip, vision):
-        self.on_trip, self.vision = on_trip, vision
+    def __init__(self, on_warning, vision):
+        self.on_warning, self.vision = on_warning, vision
         self.lock = threading.RLock()
         self.wake, self.closed = threading.Event(), threading.Event()
         self.latest = None
         self.result_at = self.source_at = None
         self.overlay = None
-        self.latched = False
+        self.last_warning = None
         self.data = {"level": "STARTING", "ready": False, "reason": "Starting hand detection…",
                      "frame_id": None, "hands": [], "inference_ms": None, "zone_source": None}
         self.thread = threading.Thread(target=self._run, name="workspace-hands", daemon=True)
@@ -38,38 +38,20 @@ class HandMonitor:
             self.latest = (jpeg, frame_id, camera or {}, time.monotonic())
         self.wake.set()
 
-    def _problem(self, ignore_latch=False):
+    def _problem(self):
         if not self.data["ready"]:
             return self.data["reason"]
         if self.result_at is None or self.source_at is None or time.monotonic() - min(self.result_at, self.source_at) > HAND_MAX_AGE_SECONDS:
-            return "Hand detection or workspace camera is stale. VLA STOP."
-        if self.data["level"] in ("RED", "ERROR"):
-            return self.data["reason"]
-        if self.latched and not ignore_latch:
-            return "Hand monitor STOP is latched. Clear the zone, then click Execute to restart."
+            return "Hand monitoring is stale; warnings are unavailable."
         return None
-
-    def problem(self):
-        with self.lock:
-            problem = self._problem()
-            if problem and self.data["ready"]:
-                self.latched = True
-            return problem
-
-    def rearm(self):
-        with self.lock:
-            problem = self._problem(ignore_latch=True)
-            if problem:
-                raise RuntimeError(problem)
-            self.latched = False
 
     def snapshot(self):
         with self.lock:
             data = copy.deepcopy(self.data)
-            problem = self._problem(ignore_latch=True)
+            problem = self._problem()
             if problem and data["level"] not in ("STARTING", "RED", "ERROR"):
                 data.update(level="ERROR", reason=problem, ready=False)
-            data.update(latched=self.latched, restart_allowed=problem is None,
+            data.update(warning_only=True,
                         overlay_frame_id=self.data["frame_id"] if self.overlay is not None and self.source_at is not None and time.monotonic()-self.source_at <= HAND_MAX_AGE_SECONDS else None,
                         age_ms=None if self.source_at is None else round((time.monotonic()-self.source_at)*1000))
             return data
@@ -80,12 +62,12 @@ class HandMonitor:
 
     def _fail(self, reason):
         with self.lock:
-            trip = not self.latched
-            self.latched = True
+            notify = reason != self.last_warning
+            self.last_warning = reason
             self.data.update(level="ERROR", ready=False, reason=reason, hands=[])
             self.overlay = None
-        if trip:
-            self.on_trip(reason)
+        if notify:
+            self.on_warning(reason)
 
     def _zones(self, cv, np, shape):
         height, width = shape[:2]
@@ -119,7 +101,7 @@ class HandMonitor:
                 with self.lock:
                     pending = self.latest
                 if pending is None or time.monotonic()-pending[3] > HAND_MAX_AGE_SECONDS:
-                    self._fail("Workspace camera is stale or unavailable. VLA STOP.")
+                    self._fail("Hand monitoring has no fresh workspace image; warnings are unavailable.")
                     continue
                 jpeg, frame_id, camera, received = pending
                 key = (camera.get("camera_unique_id"), camera.get("camera_queue"), frame_id)
@@ -170,22 +152,23 @@ class HandMonitor:
                     ok, encoded = cv.imencode(".jpg", image)
                     if not ok:
                         raise RuntimeError("Hand overlay could not be encoded.")
-                    reason = {"RED": "Hand in exclusion zone. VLA STOP.", "YELLOW": "Hand approaching robot operating zone.",
-                              "CLEAR": "Hand monitor active; exclusion zone clear."}[level]
+                    reason = {"RED": "Hand in exclusion zone. Warning only; robot motion remains enabled.",
+                              "YELLOW": "Hand approaching robot operating zone. Warning only.",
+                              "CLEAR": "Hand monitor active; zone clear. Alerts are warning-only."}[level]
                     with self.lock:
-                        trip = level == "RED" and not self.latched
-                        if level == "RED":
-                            self.latched = True
+                        warning = reason if level in ("RED", "YELLOW") else None
+                        notify = warning is not None and warning != self.last_warning
+                        self.last_warning = warning
                         self.source_at, self.result_at = received, time.monotonic()
                         self.overlay = encoded.tobytes()
                         self.data.update(level=level, ready=True, reason=reason, frame_id=frame_id, hands=hands,
                                          inference_ms=round((time.monotonic()-started)*1000, 1), zone_source=zone_source)
-                    if trip:
-                        self.on_trip(reason)
+                    if notify:
+                        self.on_warning(reason)
                 except Exception as exc:
-                    self._fail(f"Hand detection failed: {type(exc).__name__}: {str(exc)[:200]}. VLA STOP.")
+                    self._fail(f"Hand detection failed: {type(exc).__name__}: {str(exc)[:200]}. Warnings unavailable.")
         except Exception as exc:
-            self._fail(f"Hand detector unavailable: {type(exc).__name__}: {str(exc)[:200]}. VLA STOP.")
+            self._fail(f"Hand detector unavailable: {type(exc).__name__}: {str(exc)[:200]}. Warnings unavailable.")
         finally:
             if detector is not None:
                 detector.close()

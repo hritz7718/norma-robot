@@ -39,6 +39,7 @@
         </div>
       </div>
       <p id="status-detail" class="muted" role="status">Enter an instruction, then click Execute.</p>
+      <p id="execution-mode" class="muted" role="status">Execute chooses positioning + VLA when setup is valid; otherwise direct VLA.</p>
       <p id="interpreted-instruction" class="muted" hidden></p>
       <p id="hand-warning" class="hand-warning" role="alert">Starting hand monitor…</p>
       <p class="muted">Hand monitoring covers the full workspace image. The red camera zone is independent of the four homography references; its surrounding image border gives a yellow warning.</p>
@@ -47,14 +48,15 @@
         <button id="speech-button" type="button">Test voice</button>
         <span id="speech-status" class="muted" role="status">Click Test voice to enable spoken alerts.</span>
       </div>
-      <p class="muted">Hand monitoring is a camera-based prototype. Red stops VLA commands; it does not stop teleoperation or replace a physical emergency stop.</p>
+      <p class="muted">Hand alerts are warnings only and do not stop robot movement. Use STOP to cancel execution. This camera-based prototype does not replace a physical emergency stop.</p>
       <p class="muted">STOP cancels software commands and leaves torque unchanged. It is not a physical emergency stop.</p>
       <p id="request-error" class="error" role="alert" hidden></p>
     </section>
 
     <section class="cameras" aria-label="Live cameras">
       <figure class="panel camera-card">
-        <figcaption><strong>Workspace</strong><span id="camera-status-workspace" class="muted">Waiting</span></figcaption>
+        <figcaption><strong>Workspace</strong><select id="workspace-camera" aria-label="Choose tabletop camera"><option value="">Choose tabletop camera</option></select><span id="camera-status-workspace" class="muted">Waiting</span></figcaption>
+        <p id="camera-selection-help" class="muted" hidden>These are unassigned live previews. Choose the camera showing the tabletop. Execution stays stopped until the workspace feed is identified.</p>
         <div class="camera-image">
           <img id="camera-workspace" alt="Live workspace camera" hidden>
           <span id="camera-placeholder-workspace">Waiting for camera</span>

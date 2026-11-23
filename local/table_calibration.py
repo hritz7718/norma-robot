@@ -21,16 +21,16 @@ from PIL import Image
 
 # Support the explicit script launcher from any working directory.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from local.mission_control.config import ROOT, STATION, CAMERAS, MANUAL_CALIBRATION, FOLLOWER, MOTOR_IDS
+from local.mission_control.config import ROOT, STATION, CAMERAS, MANUAL_CALIBRATION, FOLLOWER, MOTOR_IDS, TAUGHT_POINT_COUNT
 from local.mission_control.cameras import CameraReader
 from local.mission_control.station import decode_motors
-from local.mission_control.positioning import TaughtMapping, homography_signature
+from local.mission_control.positioning import TaughtMapping, homography_signature, teaching_point_count
 
 
 
 HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>4-point camera calibration</title><script src="/calibration/app.js" defer></script>
+<title>Robot setup · six poses</title><script src="/calibration/app.js" defer></script>
 <style>
 :root{color-scheme:dark;font:15px system-ui;background:#10151c;color:#e5eaf0}
 body{max-width:960px;margin:24px auto;padding:0 18px}h1{font-size:1.5rem}p{line-height:1.5}
@@ -40,16 +40,25 @@ button{cursor:pointer}button:disabled{opacity:.45;cursor:default}input{width:110
 canvas{display:block;width:100%;height:auto;max-height:none;background:#080d14;cursor:crosshair;outline:1px solid #425065}
 [hidden]{display:none!important}table{width:100%;border-collapse:collapse;margin:16px 0}th,td{text-align:left;padding:8px;border-bottom:1px solid #2c3746}
 .table{overflow-x:auto}#coordinates{font-variant-numeric:tabular-nums;font-size:1.05rem}
+details{margin:14px 0}summary{cursor:pointer;color:#9baabb}#status,#teach-status{white-space:pre-line}
+canvas{max-width:420px}.point-nav{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}.point-nav button{min-width:44px}
+.point-nav button[aria-pressed="true"]{outline:2px solid #9bc5ff}.point-nav button.saved{border-color:#8ed5b7;color:#8ed5b7}
 </style></head><body>
-<h1>4-point camera calibration</h1>
+<h1>Teach 6 points</h1>
+<p id="setup-guide" role="status">Saved camera calibration is reused automatically.</p>
+<p class="muted">Teaching is optional for Mission Control: missing or invalid setup uses direct VLA. Validated teaching adds the positioning approach.</p>
+<p id="status" role="status">Connecting to Station…</p>
+<button id="relink-camera" hidden>Use saved calibration for this camera view</button>
+<details id="camera-settings"><summary id="camera-summary">Camera calibration settings</summary>
 <p class="muted">Capture the workspace camera. Click four points and enter each point’s real-world X/Y in millimetres. Keep the camera fixed after saving.</p>
 <label for="camera">Tabletop camera</label> <select id="camera"><option value="">Waiting for cameras…</option></select>
 <div class="buttons"><button id="capture">Capture image</button><button id="recalibrate">Recalibrate</button><button id="save" disabled>Save calibration</button></div>
-<p id="status" role="status">Connecting to Station…</p>
-<canvas id="image" hidden aria-label="Captured tabletop image; click to select calibration points or inspect coordinates"></canvas>
-<p id="coordinates" role="status"></p>
 <div class="table"><table><thead><tr><th>Point</th><th>Pixel (u, v)</th><th>X · mm</th><th>Y · mm</th></tr></thead><tbody id="points"></tbody></table></div>
 <p class="muted" id="saved-path"></p>
+</details>
+<canvas id="image" hidden aria-label="Captured tabletop image; click a tabletop reference to fill robot X/Y"></canvas>
+<p id="coordinates" role="status"></p>
+<details hidden><summary>Advanced: robot-base measurements (optional for taught positioning)</summary>
 <div class="table"><table><thead><tr><th>Robot base</th><th>Pixel (u, v)</th><th>X · mm</th><th>Y · mm</th></tr></thead>
 <tbody><tr><td><button id="pick-base" disabled>Select base point</button></td><td id="base-pixel">Not selected</td>
 <td><input id="base-x" type="number" step="any" aria-label="Base origin table X in mm"></td>
@@ -61,27 +70,39 @@ canvas{display:block;width:100%;height:auto;max-height:none;background:#080d14;c
 <p><label><input id="base-fixed" type="checkbox" checked style="width:auto"> Base and tabletop are level; robot, camera and tabletop references will remain fixed.</label></p>
 <button id="save-base" disabled>Save base alignment</button>
 <p id="base-status" role="status">Save camera calibration first, then align the robot base.</p>
-<h2>Teach Robot · 9 points</h2>
-<p class="muted">Teaching points may extend beyond the four homography references. Enter their measured coordinates in the same table coordinate system.</p>
-<p>Use your existing Leader → Follower teleoperation to hold the gripper above each reference point. Enter its table X/Y and measured gripper height Z, then click Save Point. Keep the same height, gripper orientation and opening for all nine points.</p>
-<p class="muted">This page records Follower feedback only. It does not move the robot or change teleoperation or torque. Click the calibrated tabletop image to fill X/Y; click the table point directly below the gripper, rather than its elevated tip.</p>
+</details>
+<h2 id="teach-heading" hidden>Save six robot poses</h2>
+<p>Move the gripper above each reference point using teleoperation. Enter X/Y and save. Keep the same height, orientation and gripper opening for all six.</p>
+<div id="point-nav" class="point-nav" aria-label="Six reference points"></div>
 <div class="buttons">
-<label>Point <select id="teach-slot" aria-label="Teaching point number"></select></label>
+<label hidden>Point <select id="teach-slot" aria-label="Teaching point number"></select></label>
 <label>X · mm <input id="teach-x" type="number" step="any"></label>
 <label>Y · mm <input id="teach-y" type="number" step="any"></label>
-<label>Z above table · mm <input id="teach-z" type="number" step="any" min="1" max="500" placeholder="Measured height"></label>
+<label>Height · mm (enter once) <input id="teach-z" type="number" step="any" min="1" max="500" placeholder="Above the table"></label>
 </div>
-<button id="teach-save" disabled>Save Point</button>
-<button id="teach-reset" disabled>Start new teaching set</button>
-<p id="teach-status" role="status">Save the camera calibration, then teach nine points across the workspace.</p>
+<button id="teach-save" disabled>Save point 1</button>
+<details><summary>Start over</summary><button id="teach-reset" disabled>Clear saved points</button></details>
+<p id="teach-status" role="status">Connecting…</p>
+<details hidden><summary>Saved poses and joint values</summary>
 <div class="table"><table><thead><tr><th>Point</th><th>Table X / Y / Z · mm</th><th>Follower joints 1–8 · ticks</th></tr></thead><tbody id="teach-points"></tbody></table></div>
 <p class="muted" id="teach-path"></p>
-<p>After all nine points are saved, enter an X/Y between points and preview the estimated joint targets. Preview does not move the robot.</p>
-<button id="teach-preview" disabled>Preview interpolation</button>
-<p id="teach-preview-result" class="muted" role="status"></p>
-<p><label><input id="teach-validated" type="checkbox" style="width:auto"> I physically checked interpolated positions and clearance at this height, kept the gripper orientation/opening consistent, and kept the robot, camera and table fixed.</label></p>
-<button id="teach-enable" disabled>Enable taught controller</button>
-<p class="muted">Execute uses the validated taught height. Start from any taught pose and disable mirroring before Execute. Interpolation estimates height; it does not measure live Cartesian clearance. Changing a teaching point disables the controller until revalidated.</p>
+</details>
+<section id="validation-step" hidden>
+<div hidden><input id="check-x" type="number" step="any"><input id="check-y" type="number" step="any"></div>
+<button id="teach-preview" disabled hidden>Retry position check · no movement</button>
+<details><summary>Position to check manually · no automatic movement</summary><p id="teach-preview-result" class="muted" role="status"></p><p class="muted">Use existing manual controls to check these estimated joint targets against the shown table position and height.</p></details>
+<p><label><input id="teach-validated" type="checkbox" style="width:auto"> I checked the intermediate position and clearance. The robot, camera and table remain fixed.</label></p>
+<button id="teach-enable" disabled>Finish setup</button>
+<p class="muted">After setup, disable mirroring and use Mission Control Execute. The taught approach is optional.</p>
+</section>
+<details hidden><summary>What errors mean</summary><ul>
+<li><strong>Station unavailable / stale feedback:</strong> check Station at localhost:8888 and the Follower connection, then retry.</li>
+<li><strong>Still moving:</strong> hold the arm steady for one second before saving.</li>
+<li><strong>Motor limit / fault:</strong> check the named servo in Station. Camera calibration does not set motor limits.</li>
+<li><strong>Different height:</strong> use the same measured gripper height for every pose.</li>
+<li><strong>Setup not enabled:</strong> save every pose, preview an in-between point, physically check it and Finish setup.</li>
+<li><strong>Approach start:</strong> Mission Control uses the taught approach when the current pose supports it. Other poses use direct VLA.</li>
+</ul></details>
 </body></html>"""
 
 JS = r"""(() => {
@@ -90,13 +111,32 @@ JS = r"""(() => {
   const prefix = '/calibration';
   const canvas = $('image'), ctx = canvas.getContext('2d');
   let token, capture, image, saved, selecting = true, points = [], lookup = null, busy = false, cameraKey = '';
+  let restoredCamera = null;
   let pickingBase = false, basePixel = null;
   let taught = null, teachingMatches = false, teachingError = '';
   let previewSignature = null;
+  let teachCount = 6;
   $('base-x').value='-170'; $('base-y').value='185'; $('base-yaw').value='0'; $('base-height').value='35';
   function status(message, error = false) {
-    $('status').textContent = message;
+    $('status').textContent = error ? explainError(message) : message;
     $('status').className = error ? 'error' : message.startsWith('Calibration Successful') ? 'good' : '';
+  }
+  function explainError(message) {
+    const value=String(message);
+    if(value.includes('\nNext:')) return value;
+    const help=[
+      [/not found|404/i,'Stop the old calibration program, run it again, then refresh this page.'],
+      [/still moving/i,'Hold the Follower steady for one second, then Save pose again.'],
+      [/motor limits are not calibrated/i,'Complete Follower servo calibration in Station, then retry teaching.'],
+      [/outside.*motor limits|exceeds.*servo limits/i,'Move the named joint inside its actual servo limits. These limits are independent of the homography box.'],
+      [/motor fault|eight.*report|eight.*motors|Follower is missing/i,'Check Follower 5B8E113018 and motors 1–8 in Station; resolve missing motors or faults before retrying.'],
+      [/same.*height|height.*within|taught.*mm/i,'Keep the gripper at the same measured height for every pose. Use that height for Execute.'],
+      [/teaching changed since preview/i,'Preview the current saved poses again, physically check them, then Finish setup.'],
+      [/calibration changed|different camera|resolution changed/i,'Reconnect the calibrated workspace camera. If the camera or reference setup moved, recalibrate and start a new teaching set.'],
+      [/outside.*taught region|outside.*region surrounded/i,'Choose a target inside the area surrounded by your robot poses, or teach a wider reachable area.'],
+      [/stale|not advancing|unavailable|setup timed out|camera.*connected|timed out|Station.*failed/i,'Check Station at localhost:8888, the workspace camera and Follower connection, then retry.']
+    ].find(([pattern])=>pattern.test(value));
+    return help ? `${value}\nNext: ${help[1]}` : value;
   }
   async function api(path, payload) {
     const controller = new AbortController();
@@ -107,8 +147,12 @@ JS = r"""(() => {
         body:JSON.stringify(payload),signal:controller.signal
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || 'Request failed.');
+      if (!response.ok) throw new Error(explainError(result.error || 'Request failed.'));
       return result;
+    } catch(error) {
+      if(error.name==='AbortError') throw new Error('The request took too long. Check Station at localhost:8888 and retry.');
+      if(error instanceof TypeError) throw new Error('Calibration server is unreachable. Restart local/table_calibration.py, then refresh this page.');
+      throw error;
     } finally { clearTimeout(timer); }
   }
   function world() {
@@ -118,6 +162,10 @@ JS = r"""(() => {
     $('capture').disabled = busy || !token || !$('camera').value;
     $('recalibrate').disabled = busy || !token || !$('camera').value;
     $('camera').disabled = busy;
+    const relink=Boolean(saved && capture && saved.camera_unique_id!==capture.camera_unique_id &&
+      saved.image_size[0]===capture.image_size[0] && saved.image_size[1]===capture.image_size[1]);
+    $('relink-camera').hidden=!relink;
+    $('relink-camera').disabled=busy;
     $('save').disabled = busy || !selecting || points.length !== 4 || !world().flat().every(Number.isFinite);
     for (let i=0;i<4;i++) for (const axis of ['x','y']) $(`${axis}${i}`).disabled=busy || !selecting;
     $('pick-base').disabled=busy || selecting || !image || !saved;
@@ -126,11 +174,24 @@ JS = r"""(() => {
     $('teach-save').disabled=busy || !token || !saved || !teachingMatches ||
       !['teach-x','teach-y','teach-z'].every(id=>Number.isFinite($(id).valueAsNumber)) || !$('teach-z').checkValidity();
     $('teach-reset').disabled=busy || !token || !saved;
-    const nineReady = teachingMatches && taught?.points.length === 9;
-    $('teach-preview').disabled=busy || !token || !nineReady || !['teach-x','teach-y'].every(id=>Number.isFinite($(id).valueAsNumber));
-    $('teach-enable').disabled=busy || !token || !nineReady || !previewSignature || !$('teach-validated').checked;
+    const allReady = teachingMatches && taught?.points.length === teachCount;
+    $('teach-save').textContent=`${taught?.points.some(point=>point.slot===Number($('teach-slot').value)) ? 'Update' : 'Save'} point ${$('teach-slot').value || 1}`;
+    for(const button of $('point-nav').children) {
+      const slot=Number(button.dataset.slot),done=Boolean(taught?.points.some(point=>point.slot===slot));
+      button.textContent=`${slot}${done ? ' ✓' : ''}`;button.classList.toggle('saved',done);
+      button.setAttribute('aria-pressed',String(slot===Number($('teach-slot').value)));button.disabled=busy;
+    }
+    const missing=[['teach-x','X'],['teach-y','Y'],['teach-z','gripper height']].filter(([id])=>!Number.isFinite($(id).valueAsNumber)).map(([,name])=>name);
+    $('teach-save').title=busy ? 'Reading feedback; hold still.' : !saved ? 'Saved camera calibration is required.' :
+      !teachingMatches ? 'Start a new teaching set for this camera calibration.' : missing.length ? `Enter ${missing.join(', ')} first.` : 'Record fresh Follower joint positions at this pose.';
+    if(!busy && !teachingError && teachingMatches && missing.length && (taught?.points.length || 0)<teachCount) {
+      $('teach-status').textContent=`${taught?.points.length || 0}/${teachCount} poses saved. Enter ${missing.join(', ')}, hold the gripper still, then Save pose.`;
+    }
+    $('validation-step').hidden=!allReady || Boolean(taught?.motion_enabled && taught?.physically_validated);
+    $('teach-preview').disabled=busy || !token || !allReady || !['check-x','check-y'].every(id=>Number.isFinite($(id).valueAsNumber));
+    $('teach-enable').disabled=busy || !token || !allReady || !previewSignature || !$('teach-validated').checked;
     $('teach-validated').disabled=busy;
-    for (const id of ['teach-slot','teach-x','teach-y','teach-z']) $(id).disabled=busy;
+    for (const id of ['teach-slot','teach-x','teach-y','teach-z','check-x','check-y']) $(id).disabled=busy;
   }
   function rows() {
     for (let i = 0; i < 4; i++) {
@@ -170,7 +231,9 @@ JS = r"""(() => {
       });
       capture=next;image=nextImage;pickingBase=false;basePixel=null;
       canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;canvas.hidden=false;
-      selecting=recalibrate || !saved || saved.camera_source!==next.camera_source || saved.image_size[0]!==canvas.width || saved.image_size[1]!==canvas.height;
+      const sameCamera=saved && (saved.camera_unique_id ? saved.camera_unique_id===next.camera_unique_id : saved.camera_source===next.camera_source);
+      selecting=recalibrate || !sameCamera || saved.image_size[0]!==canvas.width || saved.image_size[1]!==canvas.height;
+      $('camera-settings').open=selecting;
       points=selecting ? [] : saved.pixel_points.map(p=>p.slice());lookup=null;$('coordinates').textContent='';
       status(selecting ? 'Click point 1 of 4, then enter its X/Y coordinates.' : 'Calibration Successful — click the image to read X/Y coordinates.');
       rows();draw();
@@ -206,6 +269,18 @@ JS = r"""(() => {
     }
   });
   $('capture').addEventListener('click',()=>takePicture(false));
+  $('relink-camera').addEventListener('click',async()=>{
+    if(!confirm('Confirm this is the same fixed tabletop camera and the camera/table reference points have NOT moved. If the viewpoint changed, cancel and recalibrate instead.')) return;
+    busy=true;controls();
+    try {
+      const data=await api('/api/relink-camera',{capture_id:capture.capture_id,unchanged_view:true});
+      saved=data.saved;renderTeaching(data);selecting=false;
+      points=saved.pixel_points.map(point=>point.slice());previewSignature=null;$('teach-validated').checked=false;
+      $('camera-settings').open=false;rows();draw();
+      status('Camera reconnected. Saved homography retained; robot poses retained.');
+    } catch(error) { status(error.message,true); }
+    finally { busy=false;controls(); }
+  });
   $('camera').addEventListener('change',()=>{
     image=null;capture=null;points=[];lookup=null;selecting=true;pickingBase=false;basePixel=null;canvas.hidden=true;
     $('coordinates').textContent='';rows();status('Click Capture image for the selected camera.');
@@ -242,9 +317,20 @@ JS = r"""(() => {
   });
   function renderTeaching(data) {
     taught=data.teaching;teachingMatches=data.teaching_matches;
+    const required=data.required_points || 6;
+    if(required!==teachCount) { teachCount=required;fillSlots(); }
+    document.querySelector('h1').textContent=`Teach ${teachCount} points`;
+    $('teach-heading').textContent=`1. Save ${teachCount} robot poses`;
     $('teach-path').textContent=`Teaching file: ${data.teaching_path}`;
     const items=taught?.points || [];
-    $('teach-points').replaceChildren(...Array.from({length:9},(_,index)=>{
+    const cameraSaved=Boolean(saved || data.saved);
+    const enabled=teachingMatches && taught?.motion_enabled && taught?.physically_validated;
+    $('setup-guide').textContent=!cameraSaved ? 'Step 1: Capture the tabletop, click four reference points, enter measured X/Y, then Save calibration.' :
+      !teachingMatches ? 'Camera calibration saved. Start a new teaching set for this camera calibration.' :
+      enabled ? 'Setup saved. Open Mission Control, disable mirroring, then click Execute. The calibrated approach is optional.' :
+      items.length<teachCount ? `Camera ready. Save ${teachCount} robot poses at the same height (${items.length}/${teachCount} saved).` :
+      'All poses saved. Check an in-between position once, then Finish setup.';
+    $('teach-points').replaceChildren(...Array.from({length:teachCount},(_,index)=>{
       const point=items.find(item=>item.slot===index+1),row=document.createElement('tr');
       for(const value of [index+1,point ? [point.table_mm.x,point.table_mm.y,point.table_mm.z].join(' / ') : 'Not taught',point ? point.joint_ticks.join(', ') : '—']) {
         const cell=document.createElement('td');cell.textContent=value;row.append(cell);
@@ -252,15 +338,30 @@ JS = r"""(() => {
       return row;
     }));
     if(!busy) {
-      $('teach-status').textContent=teachingError || data.teaching_error || (!teachingMatches ?
+      $('teach-status').className=teachingError || data.teaching_error ? 'error' : enabled ? 'good' : '';
+      $('teach-status').textContent=explainError(teachingError || data.teaching_error || (!teachingMatches ?
         (saved || data.saved ? 'Camera calibration changed. Start a new teaching set before saving points.' : 'Save camera calibration before teaching robot points.') :
-        `${items.length} / 9 points saved. ${taught?.motion_enabled && taught?.physically_validated ? 'Taught controller enabled. Start from a taught pose with mirroring disabled.' : items.length===9 ? 'Preview interpolation, physically validate it, then enable the controller.' : 'Hold the Follower still, enter X/Y/Z, then Save Point.'}`);
+        `${items.length}/${teachCount} poses saved. ${enabled ? 'Setup complete. Disable mirroring and use Mission Control Execute.' : items.length===teachCount ? previewSignature ? 'Preview ready. Physically check it, confirm the checkbox and Finish setup.' : 'Preview the check position below, physically check it, then Finish setup.' : 'Move to the next reference point, enter X/Y/height and Save pose.'}`));
       if(!$('teach-z').value && items.length) $('teach-z').value=taught.safe_height_mm;
+      if(items.length===teachCount && !$('check-x').value && !$('check-y').value) {
+        $('check-x').value=(items.reduce((sum,point)=>sum+point.table_mm.x,0)/items.length).toFixed(2);
+        $('check-y').value=(items.reduce((sum,point)=>sum+point.table_mm.y,0)/items.length).toFixed(2);
+      }
     }
   }
-  for(let slot=1;slot<=9;slot++) {
-    const option=document.createElement('option');option.value=slot;option.textContent=slot;$('teach-slot').append(option);
+  function fillSlots() {
+    const selected=Number($('teach-slot').value) || 1;
+    $('teach-slot').replaceChildren(...Array.from({length:teachCount},(_,i)=>{
+      const option=document.createElement('option');option.value=i+1;option.textContent=i+1;return option;
+    }));
+    $('teach-slot').value=Math.min(selected,teachCount);
+    $('point-nav').replaceChildren(...Array.from({length:teachCount},(_,i)=>{
+      const button=document.createElement('button');button.type='button';button.dataset.slot=i+1;button.textContent=i+1;
+      button.addEventListener('click',()=>{ $('teach-slot').value=i+1;$('teach-slot').dispatchEvent(new Event('change')); });
+      return button;
+    }));
   }
+  fillSlots();
   for(const id of ['teach-x','teach-y','teach-z']) $(id).addEventListener('input',controls);
   $('teach-slot').addEventListener('change',()=>{
     const point=taught?.points.find(item=>item.slot===Number($('teach-slot').value));
@@ -275,8 +376,9 @@ JS = r"""(() => {
       const data=await api('/api/teach-point',{slot:Number($('teach-slot').value),x_mm:$('teach-x').valueAsNumber,
         y_mm:$('teach-y').valueAsNumber,z_mm:$('teach-z').valueAsNumber});
       previewSignature=null;$('teach-validated').checked=false;$('teach-preview-result').textContent='';
-      renderTeaching(data);$('teach-status').textContent=`Point ${$('teach-slot').value} saved (${data.teaching.points.length} / 9).`;
-      const next=Array.from({length:9},(_,i)=>i+1).find(slot=>!data.teaching.points.some(point=>point.slot===slot));
+      $('check-x').value='';$('check-y').value='';
+      renderTeaching(data);$('teach-status').textContent=`Pose ${$('teach-slot').value} saved (${data.teaching.points.length}/${teachCount}).`;
+      const next=Array.from({length:teachCount},(_,i)=>i+1).find(slot=>!data.teaching.points.some(point=>point.slot===slot));
       if(next) { $('teach-slot').value=next;$('teach-x').value='';$('teach-y').value=''; }
     } catch(error) { teachingError=error.message;$('teach-status').textContent=error.message; }
     finally { busy=false;controls(); }
@@ -288,19 +390,23 @@ JS = r"""(() => {
     try {
       const data=await api('/api/teach-reset',{confirm:true});
       previewSignature=null;$('teach-validated').checked=false;$('teach-preview-result').textContent='';
+      $('check-x').value='';$('check-y').value='';
       renderTeaching(data);$('teach-slot').value=1;$('teach-x').value='';$('teach-y').value='';$('teach-z').value='';
       $('teach-status').textContent='New teaching set started. Enter the measured height and teach point 1.';
     } catch(error) { teachingError=error.message;$('teach-status').textContent=error.message; }
     finally { busy=false;controls(); }
   });
   $('teach-validated').addEventListener('change',controls);
+  for(const id of ['check-x','check-y']) $(id).addEventListener('input',controls);
   $('teach-preview').addEventListener('click',async()=>{
     teachingError='';busy=true;controls();
     try {
-      const data=await api('/api/teach-preview',{x_mm:$('teach-x').valueAsNumber,y_mm:$('teach-y').valueAsNumber});
+      const data=await api('/api/teach-preview',{x_mm:$('check-x').valueAsNumber,y_mm:$('check-y').valueAsNumber});
       previewSignature=data.signature;
+      $('teach-preview').hidden=true;
       $('teach-preview-result').textContent=`Estimated table ${data.table_mm.join(', ')} mm → joints 1–8: ${data.joint_ticks.join(', ')} ticks. Preview only; no movement.`;
-    } catch(error) { previewSignature=null;teachingError=error.message;$('teach-status').textContent=error.message; }
+      $('teach-status').textContent='Preview ready; no movement sent. Physically check the position and clearance, confirm the checkbox, then Finish setup.';
+    } catch(error) { previewSignature=null;teachingError=error.message;$('teach-status').textContent=error.message;$('teach-preview').hidden=false; }
     finally { busy=false;controls(); }
   });
   $('teach-enable').addEventListener('click',async()=>{
@@ -308,7 +414,7 @@ JS = r"""(() => {
     try {
       const data=await api('/api/teach-enable',{signature:previewSignature,confirmed:$('teach-validated').checked});
       renderTeaching(data);previewSignature=null;
-      $('teach-status').textContent='Taught controller enabled. Start from a taught pose, disable mirroring, then use Mission Control Execute.';
+      $('teach-status').textContent='Setup complete. Disable mirroring, then open http://127.0.0.1:8892 and click Execute.';
     } catch(error) { teachingError=error.message;$('teach-status').textContent=error.message; }
     finally { busy=false;controls(); }
   });
@@ -332,6 +438,10 @@ JS = r"""(() => {
       renderTeaching(data);
       if(!token) {
         token=data.token;saved=data.saved;
+        if(!saved) {
+          $('camera-settings').open=true;
+          $('camera-summary').textContent='Camera calibration required · set it up once';
+        }
         if(data.base_alignment) {
           const base=data.base_alignment;
           for (const [id,key] of [['base-x','table_xy_mm'],['base-y','table_xy_mm'],['base-yaw','yaw_deg'],['base-height','height_above_table_mm']]) {
@@ -340,6 +450,8 @@ JS = r"""(() => {
           $('base-status').textContent=data.base_alignment_status;
         }
         if(saved) {
+          $('camera-settings').open=false;
+          $('camera-summary').textContent='Camera calibration saved · change settings only if needed';
           saved.table_points_mm.forEach((xy,i)=>{ $(`x${i}`).value=xy[0];$(`y${i}`).value=xy[1]; });
           $('saved-path').textContent=`Saved: ${data.output_path}`;
         }
@@ -351,12 +463,26 @@ JS = r"""(() => {
           const option=document.createElement('option');option.value=camera.queue;
           option.textContent=`${index+1}: ${camera.name}${camera.serial ? ' · '+camera.serial : ''}`;return option;
         }));
-        const preferred=cameras.find(camera=>camera.queue===previous) || cameras.find(camera=>camera.source===saved?.camera_source) || cameras[Math.min(data.default_camera_index || 0,cameras.length-1)];
+        const preferred=cameras.find(camera=>camera.queue===previous) || cameras.find(camera=>saved?.camera_unique_id && camera.unique_id===saved.camera_unique_id) || cameras.find(camera=>camera.source===saved?.camera_source) || cameras[Math.min(data.default_camera_index || 0,cameras.length-1)];
         if(preferred) $('camera').value=preferred.queue;
         cameraKey=key;
       }
       if(!image && !busy) status(data.camera_error || (cameras.length ? 'Choose the tabletop camera, then click Capture image.' : 'Waiting for Station camera streams…'),Boolean(data.camera_error && !/^(Connecting|Waiting)/.test(data.camera_error)));
+      const calibratedCamera=cameras.find(camera=>camera.queue===$('camera').value && camera.ready &&
+        (saved?.camera_unique_id ? camera.unique_id===saved.camera_unique_id : saved && camera.source===saved.camera_source));
+      if(saved && cameras.length && !cameras.some(camera=>camera.unique_id===saved.camera_unique_id)) {
+        $('camera-settings').open=true;
+        $('camera-summary').textContent='Camera reconnected · select the tabletop view';
+        if(!busy) status('The saved USB camera ID changed. You can still save measured robot poses. To reuse the image mapping, select the tabletop camera, Capture image, then use the relink button if the physical view is unchanged.');
+      }
+      if(!image && !busy && calibratedCamera && restoredCamera!==calibratedCamera.queue) {
+        restoredCamera=calibratedCamera.queue;
+        await takePicture(false);
+      }
       controls();
+      if(!busy && !teachingError && !previewSignature && !taught?.motion_enabled && !$('teach-preview').disabled) {
+        $('teach-preview').click();
+      }
     } catch(error) { if(!image && !busy) status(error.message,true); }
     finally { setTimeout(cameraState,1000); }
   }
@@ -402,6 +528,7 @@ class Calibration:
                 self.teaching.get("calibration_signature") == self.calibration_signature()
                 and self.teaching.get("follower") == FOLLOWER and self.teaching.get("motor_ids") == list(MOTOR_IDS)))
             return {"teaching": self.teaching, "teaching_matches": matches,
+                    "required_points": teaching_point_count(self.teaching),
                     "teaching_error": self.teaching_error,
                     "teaching_path": str(self.teaching_path.relative_to(ROOT))}
 
@@ -410,6 +537,7 @@ class Calibration:
                 "motor_ids": list(MOTOR_IDS), "camera_unique_id": self.saved["camera_unique_id"],
                 "image_size": self.saved["image_size"], "calibration_path": str(self.output.relative_to(ROOT)),
                 "calibration_signature": self.calibration_signature(), "safe_height_mm": None,
+                "point_count": TAUGHT_POINT_COUNT,
                 "physically_validated": False, "motion_enabled": False, "points": []}
 
     def write_teaching(self, record):
@@ -419,6 +547,36 @@ class Calibration:
         temporary.write_text(json.dumps(record, indent=2, allow_nan=False) + "\n")
         temporary.replace(self.teaching_path)
         self.teaching, self.teaching_error = record, None
+
+    def relink_camera(self, payload):
+        if set(payload) != {"capture_id", "unchanged_view"} or payload["unchanged_view"] is not True:
+            raise ValueError("Confirm that the same physical camera and table reference setup have not moved.")
+        with self.lock:
+            capture, saved = self.capture, self.saved
+            if not capture or payload["capture_id"] != capture["capture_id"] or not saved:
+                raise ValueError("Capture the current tabletop camera first.")
+            if capture["image_size"] != saved["image_size"]:
+                raise ValueError("Camera resolution changed. Recalibrate the image coordinates.")
+            previous_signature = self.calibration_signature()
+        cameras = self.station.snapshot()["cameras"]
+        if not any(camera["queue"] == capture["camera_queue"] and camera["ready"] for camera in cameras):
+            raise ValueError("Selected camera has no fresh frames. Reconnect it and capture again.")
+        with self.lock:
+            if self.capture is not capture or self.calibration_signature() != previous_signature:
+                raise ValueError("Capture or calibration changed. Capture again before relinking.")
+            updated = dict(saved)
+            updated.update({key: capture[key] for key in ("camera_unique_id", "camera_queue", "camera_source", "image_size", "frame_id")})
+            updated["camera_relinked_at"] = time.time()
+            temporary = self.output.with_suffix(".tmp")
+            temporary.write_text(json.dumps(updated, indent=2, allow_nan=False)+"\n")
+            temporary.replace(self.output)
+            self.saved = updated
+            if self.teaching and self.teaching.get("calibration_signature") == previous_signature:
+                teaching = json.loads(json.dumps(self.teaching))
+                teaching.update(camera_unique_id=updated["camera_unique_id"], calibration_signature=self.calibration_signature(),
+                                physically_validated=False, motion_enabled=False)
+                self.write_teaching(teaching)
+            return {"saved": self.saved, **self.teaching_state()}
 
     async def follower_pose(self):
         """Read two advancing, stationary samples; never send a motor command."""
@@ -437,11 +595,16 @@ class Calibration:
                 state = st3215.InferenceStateReader(memoryview(bytes(entry.Data)))
                 feedback = decode_motors(state)
                 if [motor["id"] for motor in feedback] != list(MOTOR_IDS):
-                    raise ValueError("All eight Follower motors must report exactly once.")
-                if any(motor["status"] != "reported" for motor in feedback):
-                    raise ValueError("Follower motor fault. Point was not saved.")
-                if any(not 0 <= (time.time_ns() - motor["sample_wall_ns"]) / 1e9 < 2 for motor in feedback):
-                    raise ValueError("Follower feedback is stale. Point was not saved.")
+                    missing = [f"J{mid}" for mid in MOTOR_IDS if mid not in [motor["id"] for motor in feedback]]
+                    raise ValueError(f"All eight Follower motors must report exactly once. Missing: {', '.join(missing) or 'none; duplicate motor reports'}. Received IDs: {[motor['id'] for motor in feedback]}.")
+                faults = [f"J{motor['id']}: {motor['error'] or 'motor error'} (kind={motor['error_kind']}, servo={motor['servo_errors']})"
+                          for motor in feedback if motor["status"] != "reported"]
+                if faults:
+                    raise ValueError("Follower motor fault: " + "; ".join(faults) + ". Point was not saved.")
+                ages = {motor["id"]: (time.time_ns()-motor["sample_wall_ns"])/1e9 for motor in feedback}
+                stale = [f"J{mid}={age:.1f}s" for mid, age in ages.items() if not 0 <= age < 2]
+                if stale:
+                    raise ValueError("Follower feedback is stale: " + ", ".join(stale) + ". Point was not saved.")
                 for bus in state.get_buses():
                     serial = bus.get_bus().get_serial_number()
                     if isinstance(serial, (bytes, bytearray, memoryview)):
@@ -460,9 +623,9 @@ class Calibration:
                     position = ((4096 - (encoded & 4095)) if encoded & 0x8000 else encoded) & 4095
                     low, high = int(motor.get_range_min()), int(motor.get_range_max())
                     if not 0 <= low <= 4095 or not 0 <= high <= 4095 or low == high:
-                        raise ValueError("Follower motor limits are not calibrated.")
+                        raise ValueError(f"Follower motor limits are not calibrated for J{motor.get_id()}: min={low}, max={high}.")
                     if (position - low) % 4096 > (high - low) % 4096:
-                        raise ValueError(f"Follower J{motor.get_id()} is outside its calibrated motor limits.")
+                        raise ValueError(f"Follower J{motor.get_id()} position {position} is outside its calibrated motor limits {low}–{high} ticks. This is a servo limit, not the homography box.")
                     ticks.append(position); ranges.append([low, high])
                 return {"joint_ticks": ticks, "joint_ranges_ticks": ranges,
                         "motor_samples": [motor["sample"] for motor in feedback],
@@ -480,8 +643,10 @@ class Calibration:
                 await asyncio.sleep(.1)
             if first["joint_ranges_ticks"] != second["joint_ranges_ticks"]:
                 raise ValueError("Motor calibration changed while recording. Retry.")
-            if max(abs((b - a + 2048) % 4096 - 2048) for a, b in zip(first["joint_ticks"], second["joint_ticks"])) > 8:
-                raise ValueError("Follower is still moving. Hold it still, then click Save Point again.")
+            moving = [f"J{mid} ({abs((b-a+2048)%4096-2048)} ticks)" for mid, a, b in zip(MOTOR_IDS, first["joint_ticks"], second["joint_ticks"])
+                      if abs((b-a+2048)%4096-2048) > 8]
+            if moving:
+                raise ValueError("Follower is still moving: " + ", ".join(moving) + ". Hold it still for one second, then Save point again.")
             return second
         finally:
             client.close_connection()
@@ -491,8 +656,10 @@ class Calibration:
         if set(payload) != {"slot", "x_mm", "y_mm", "z_mm"}:
             raise ValueError("Supply the point number and measured X/Y/Z in millimetres.")
         slot = payload["slot"]
-        if type(slot) is not int or not 1 <= slot <= 9:
-            raise ValueError("Select point 1 through 9.")
+        with self.lock:
+            count = teaching_point_count(self.teaching)
+        if type(slot) is not int or not 1 <= slot <= count:
+            raise ValueError(f"Select pose 1 through {count}.")
         xyz = [payload[key] for key in ("x_mm", "y_mm", "z_mm")]
         if any(type(value) not in (int, float) or not math.isfinite(value) for value in xyz) or not 1 <= xyz[2] <= 500:
             raise ValueError("Enter finite X/Y and a measured height from 1 to 500mm.")
@@ -502,13 +669,8 @@ class Calibration:
             signature = self.calibration_signature()
             saved = self.saved
             # Homography reference points do not define the taught workspace.
-        matches = [cam for cam in self.station.snapshot()["cameras"] if cam.get("unique_id") == saved["camera_unique_id"]]
-        if len(matches) != 1:
-            raise ValueError("The calibrated tabletop camera must be connected to teach a point.")
-        jpeg, camera = self.station.capture_camera(matches[0]["queue"])
-        with Image.open(io.BytesIO(jpeg)) as image:
-            if list(image.size) != saved["image_size"]:
-                raise ValueError("Camera resolution changed. Recalibrate before teaching.")
+        # Operator-measured table X/Y and live joint readings are sufficient to
+        # record a pose. USB reconnection must not block this independent step.
         try:
             feedback = asyncio.run(asyncio.wait_for(self.follower_pose(), timeout=5))
         except TimeoutError as exc:
@@ -517,20 +679,24 @@ class Calibration:
             if signature != self.calibration_signature() or not self.teaching_state()["teaching_matches"]:
                 raise ValueError("Calibration changed while recording. Start a new teaching set.")
             record = json.loads(json.dumps(self.teaching)) if self.teaching is not None else self.new_teaching()
+            if count != teaching_point_count(record):
+                raise ValueError("Teaching set changed while saving. Select the pose again and retry.")
+            record["point_count"] = count
             others = [point for point in record["points"] if point["slot"] != slot]
             if others and any(abs(point["table_mm"]["z"] - xyz[2]) > 1 for point in others):
                 raise ValueError("Teach every point at the same measured gripper height (within 1mm).")
             if others and any(point["joint_ranges_ticks"] != feedback["joint_ranges_ticks"] for point in others):
                 raise ValueError("Follower motor calibration changed. Start a new teaching set.")
             if any(math.hypot(point["table_mm"]["x"]-xyz[0], point["table_mm"]["y"]-xyz[1]) < 1 for point in others):
-                raise ValueError("Another point already has this X/Y. Spread the nine points across the workspace.")
+                raise ValueError("Another pose already has this X/Y. Use a different measured reference point.")
             point = {"slot": slot, "table_mm": dict(zip(("x", "y", "z"), xyz)),
-                     **feedback, "camera_frame_id": camera["frame_id"], "recorded_at": time.time()}
+                     **feedback, "camera_frame_id": None, "position_source": "operator_entered_table_coordinates",
+                     "recorded_at": time.time()}
             record["points"] = sorted(others + [point], key=lambda point: point["slot"])
-            if len(record["points"]) == 9:
+            if len(record["points"]) == count:
                 xy = np.array([[point["table_mm"]["x"], point["table_mm"]["y"]] for point in record["points"]])
                 if np.linalg.matrix_rank(xy - xy[0]) < 2:
-                    raise ValueError("The nine points must span table X and Y; they cannot all lie on one line.")
+                    raise ValueError("Spread the poses across table X and Y, for example two rows of three. They cannot all lie on one line.")
             record["safe_height_mm"] = record["points"][0]["table_mm"]["z"]
             record.update(physically_validated=False, motion_enabled=False)
             self.write_teaching(record)
@@ -756,6 +922,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, self.server.app.save_base_alignment(payload))
             if path == "/api/teach-point":
                 return self.send(200, self.server.app.save_teach_point(payload))
+            if path == "/api/relink-camera":
+                return self.send(200, self.server.app.relink_camera(payload))
             if path == "/api/teach-reset":
                 return self.send(200, self.server.app.reset_teaching(payload))
             if path == "/api/teach-preview":

@@ -7,7 +7,8 @@ import math
 import sys
 import threading
 import time
-from .config import ROOT, FOLLOWER, FRESH_SECONDS, STATION, CAMERAS, MANUAL_CALIBRATION
+from .config import (ROOT, FOLLOWER, MOTOR_IDS, FRESH_SECONDS, STATION, CAMERAS,
+                     POLICY_CAMERAS, MANUAL_CALIBRATION, WORKSPACE_CAMERA_ID, CAMERA_SOURCE)
 from .cameras import CameraReader
 
 
@@ -16,24 +17,35 @@ class ReadOnlyClient:
     def __init__(self, client):
         self.__client = client
     def read_from_tail(self, queue, **kwargs):
-        if queue not in ("inference/normvla", "st3215/inference"):
+        if queue not in ("inference-states", "st3215/inference"):
             raise PermissionError("Queue is outside the observation allowlist.")
         return self.__client.read_from_tail(queue, **kwargs)
+
+    def read_from_offset(self, queue, **kwargs):
+        parts = queue.strip("/").split("/")
+        if len(parts) < 2 or (parts[-2] != "usbvideo" and parts[-2:] != ["st3215", "inference"]):
+            raise PermissionError("Queue is outside the observation allowlist.")
+        return self.__client.read_from_offset(queue, **kwargs)
 
 
 def decode_observation(frame):
     """Decode a captured observation without importing robot control helpers."""
     joints = []
-    for i, joint in enumerate(frame.get_joints() or [], 1):
+    joint_inputs = frame.get_joints() or []
+    for i, joint in enumerate(joint_inputs, 1):
         position = float(joint.get_position_norm())
         joints.append({"name": f"j{i}", "pos_norm": position if math.isfinite(position) else None,
                        "pos": int(joint.get_position()), "range_min": int(joint.get_range_min()),
                        "range_max": int(joint.get_range_max())})
+    images = frame.get_images() or []
+    image_stamps = [int(image.get_monotonic_stamp_ns()) for image in images]
     return {
         "frame_id": bytes(frame.get_global_frame_id()),
         "joints": joints,
-        "images": [bytes(image.get_jpeg()) for image in frame.get_images() or []],
-        "image_stamps_ns": [int(image.get_monotonic_stamp_ns()) for image in frame.get_images() or []],
+        "images": [bytes(image.get_jpeg()) for image in images],
+        "image_stamps_ns": image_stamps,
+        "oldest_input_ns": min([int(frame.get_monotonic_stamp_ns()), *image_stamps,
+                                *(int(joint.get_monotonic_stamp_ns()) for joint in joint_inputs)]),
     }
 
 
@@ -55,10 +67,16 @@ def decode_motors(state):
             kind = int(error.get_kind()) if error else 0
             servo = [int(x) for x in error.get_servo()] if error else []
             raw = bytes(motor.get_state())
-            fault = bool(kind or any(servo))
+            register_status = raw[0x41] if len(raw) > 0x41 else None
+            fault = bool(kind or any(servo) or register_status != 0)
+            detail = (error.get_description() or "")[:200] if error else ""
+            if not detail and register_status is None:
+                detail = "Incomplete motor registers"
+            elif not detail and register_status:
+                detail = f"Motor status register 0x{register_status:02x}"
             motors.append({"id": mid, "status": "fault" if fault else "reported",
                            "error_kind": kind, "servo_errors": servo,
-                           "error": (error.get_description() or "")[:200] if error else "",
+                           "error": detail,
                            "torque_enabled": bool(raw[0x28]) if len(raw) > 0x28 else None,
                            "sample": [motor.get_app_start_id(), motor.get_monotonic_stamp_ns()],
                            "sample_wall_ns": motor.get_system_stamp_ns()})
@@ -79,6 +97,10 @@ class StationReader:
         self.raw_cameras = None if mock else CameraReader(STATION)
         self.live_images = {}
         self.camera_metadata = {}
+        self.camera_generation = 0
+        self.observation_cameras = None
+        self.observation_streak = 0
+        self.camera_options = []
         self.camera_error = "Waiting for raw camera frames."
         self.camera_polled_at = time.monotonic()
         self.on_observation = None
@@ -117,31 +139,63 @@ class StationReader:
         from station_py.client import Client
         from target.gen_python.protobuf.drivers.inferences import normvla
         from target.gen_python.protobuf.drivers.st3215 import st3215
+        from target.gen_python.protobuf.station import drivers, inference
+        from .policy_inputs import build_observation, station_monotonic_ns
         # Client owns reconnects. Only expose the queue-reading allowlist below.
         client = Client(STATION, logging.getLogger("mission-station"))
         reader = ReadOnlyClient(client)
-        async def tail(queue):
+        async def read(queue, pointer=None):
             await client.wait_ready(timeout=5)
-            qr = reader.read_from_tail(queue, offset=b"\x00", limit=1, step=1, buf_size=1)
+            if pointer is None:
+                qr = reader.read_from_tail(queue, offset=b"\x00", limit=1, step=1, buf_size=2)
+            else:
+                if not pointer:
+                    raise RuntimeError("Station snapshot contains an empty input pointer.")
+                qr = reader.read_from_offset(queue, offset=pointer, limit=1, step=1, buf_size=2)
             entry = await asyncio.wait_for(qr.data.get(), timeout=3)
             if entry is None:
-                raise RuntimeError(f"No data from {queue}.")
+                raise RuntimeError(f"No data from {queue}: {qr.err}")
+            if pointer is not None and int.from_bytes(entry.ID.ID, "little") != int.from_bytes(pointer, "little"):
+                raise RuntimeError(f"Station returned a different entry for {queue}.")
             return entry
         async def observations():
             while not self._stop.is_set():
                 try:
-                    entry = await tail("inference/normvla")
-                    raw = bytes(entry.Data)
+                    with self.lock:
+                        cameras = self._policy_camera_keys()
+                        generation = self.camera_generation
+                    if cameras is None:
+                        raise RuntimeError("Waiting for the selected workspace and wrist cameras.")
+                    state_entry = await read("inference-states")
+                    state = inference.InferenceRxReader(memoryview(state_entry.Data))
+                    entries = state.get_entries()
+                    by_queue = {entry.get_queue(): entry for entry in entries
+                                if entry.get_type() == drivers.QueueDataType.QDT_USB_VIDEO_FRAMES}
+                    camera_refs = [by_queue.get(queue) for queue, _ in cameras]
+                    motor_refs = [entry for entry in entries
+                                  if entry.get_type() == drivers.QueueDataType.QDT_ST3215_INFERENCE]
+                    if any(ref is None for ref in camera_refs) or len(motor_refs) != 1:
+                        raise RuntimeError("Selected camera or Follower data is missing from the Station snapshot.")
+                    # Use the exact synchronized pointers. An unrelated USB camera
+                    # cannot block inference or become a model input.
+                    inputs = await asyncio.gather(*(read(ref.get_queue(), bytes(ref.get_ptr()))
+                                                    for ref in [*camera_refs, *motor_refs]))
+                    raw = build_observation(state_entry, dict(zip(POLICY_CAMERAS, inputs[:2])),
+                                            inputs[2], cameras[0][1], cameras[1][1])
                     obs = decode_observation(normvla.FrameReader(memoryview(raw)))
-                    self.update_observation(obs, raw)
+                    age_ns = station_monotonic_ns() - obs["oldest_input_ns"]
+                    clock = time.monotonic() - age_ns / 1e9
+                    with self.lock:
+                        if generation == self.camera_generation and cameras == self._policy_camera_keys():
+                            self.update_observation(obs, raw, clock, cameras=cameras)
                 except Exception as exc:
                     with self.lock:
-                        self.data["error"] = f"Observation unavailable: {type(exc).__name__}: {exc}"
-                await asyncio.sleep(0.4)
+                        self.data["error"] = f"Station model input: {str(exc) or type(exc).__name__}"
+                await asyncio.sleep(0.2)
         async def motor_feedback():
             while not self._stop.is_set():
                 try:
-                    entry = await tail("st3215/inference")
+                    entry = await read("st3215/inference")
                     state = st3215.InferenceStateReader(memoryview(bytes(entry.Data)))
                     motors = decode_motors(state)
                     self.update_motors(motors)
@@ -155,32 +209,62 @@ class StationReader:
             if client.writer:
                 client.writer.close()
 
+    def _policy_camera_keys(self):
+        if self.camera_error:
+            return None
+        cameras = [self.camera_metadata.get(role, {}) for role in POLICY_CAMERAS]
+        if not all(camera.get("ready") and camera.get("unique_id") and camera.get("queue") for camera in cameras):
+            return None
+        return tuple((camera["queue"], camera["unique_id"]) for camera in cameras)
+
     async def _camera_feedback(self):
         last = None
         while not self._stop.is_set():
+            with self.lock:
+                generation = self.camera_generation
             with self.raw_cameras.lock:
                 state = self.raw_cameras.snapshot()
                 frames = {queue: dict(value) for queue, value in self.raw_cameras.frames.items()}
             cameras = state["cameras"]
             selected, problem = {}, state["error"]
             try:
-                if MANUAL_CALIBRATION.exists():
+                saved = {}
+                try:
                     saved = json.loads(MANUAL_CALIBRATION.read_text())
-                    uid, queue = saved.get("camera_unique_id"), saved.get("camera_queue")
+                    if not isinstance(saved, dict):
+                        saved = {}
+                except (OSError, ValueError):
+                    pass
+                uid, queue = saved.get("camera_unique_id") or WORKSPACE_CAMERA_ID, saved.get("camera_queue")
+                try:
+                    source = json.loads(CAMERA_SOURCE.read_text())
+                    uid, queue = source["camera_unique_id"], source.get("camera_queue")
+                except FileNotFoundError:
+                    pass
+                if uid or queue:
                     matches = [cam for cam in cameras if (uid and cam["unique_id"] == uid)
                                or (not uid and queue and cam["queue"] == queue)]
                     if len(matches) != 1:
-                        raise ValueError("The calibrated tabletop camera is missing or ambiguous. Reconnect it or recalibrate the correct camera.")
+                        # Preview both available feeds, but keep autonomous execution
+                        # blocked until the operator identifies the workspace view.
+                        selected = {name: cameras[index] for name, index in CAMERAS.items() if index < len(cameras)}
+                        raise ValueError("USB camera IDs changed. Choose the tabletop camera in the Workspace selector.")
                     selected["workspace"] = matches[0]
-                    remaining = [cam for cam in cameras if cam["queue"] != matches[0]["queue"]]
+                    remaining = [cam for cam in cameras if cam["queue"] != matches[0]["queue"]
+                                 and cam.get("unique_id") and cam["ready"]]
                     if len(remaining) == 1:
                         selected["wrist"] = remaining[0]
                 else:
                     selected = {name: cameras[index] for name, index in CAMERAS.items() if index < len(cameras)}
-            except (OSError, ValueError, TypeError, AttributeError) as exc:
+            except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
+                if not selected:
+                    selected = {name: cameras[index] for name, index in CAMERAS.items() if index < len(cameras)}
                 problem = f"Workspace camera: {exc}"
             with self.lock:
+                if generation != self.camera_generation:
+                    continue
                 self.camera_metadata = selected
+                self.camera_options = cameras
                 self.live_images = {name: frames[cam["queue"]].get("jpeg") for name, cam in selected.items()}
                 self.camera_error = problem
                 self.camera_polled_at = time.monotonic()
@@ -194,13 +278,38 @@ class StationReader:
                         "camera_unique_id": workspace["unique_id"], "camera_queue": workspace["queue"]})
             await asyncio.sleep(.2)
 
-    def update_observation(self, obs, frame_bytes, clock=None):
+    def select_workspace_camera(self, unique_id):
+        if not self.raw_cameras:
+            raise ValueError("Camera selection requires live Station cameras.")
+        matches = [camera for camera in self.raw_cameras.snapshot()["cameras"] if camera.get("unique_id") == unique_id]
+        if len(matches) != 1 or not matches[0]["ready"]:
+            raise ValueError("Select one connected camera with fresh frames.")
+        selected = matches[0]
+        CAMERA_SOURCE.parent.mkdir(parents=True, exist_ok=True)
+        temporary = CAMERA_SOURCE.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"camera_unique_id": unique_id, "camera_queue": selected["queue"],
+                                         "selected_at": time.time()}, indent=2)+"\n")
+        with self.lock:
+            temporary.replace(CAMERA_SOURCE)
+            self.camera_generation += 1
+            self.camera_metadata = {}
+            self.camera_error = "Waiting for the selected workspace camera."
+            self.observation_cameras = None
+            self.observation_streak = 0
+
+    def update_observation(self, obs, frame_bytes, clock=None, *, cameras=None):
         clock = time.monotonic() if clock is None else clock
         fid = obs["frame_id"].hex()
         with self.lock:
+            if cameras != self.observation_cameras:
+                self.observation_cameras = cameras
+                self.observation_streak = 0
+                self.image_changed.clear()
+                self.image_stamps = []
             if fid != self.data["frame_id"]:
                 self.changed = clock
                 self.data["observation_count"] += 1
+                self.observation_streak += 1
             self.data.update({"frame_id": fid, "joints": copy.deepcopy(obs["joints"]),
                               "camera_count": len(obs["images"]), "error": ""})
             self.frame_bytes = frame_bytes
@@ -225,7 +334,13 @@ class StationReader:
                 if m["sample"] != previous.get(mid, {}).get("sample"):
                     self.motor_changed[mid] = clock - source_age
             self.data["motors"] = motors
-            self.data["motor_error"] = "" if len(motors) == 8 else "Incomplete follower motor set"
+            ids = [motor["id"] for motor in motors]
+            if not ids:
+                self.data["motor_error"] = f"Follower {FOLLOWER} is connected by USB but reports 0/8 motors. Check arm power and the motor-bus cable."
+            elif ids != list(MOTOR_IDS):
+                self.data["motor_error"] = f"Follower {FOLLOWER} reports motor IDs {ids}; expected IDs 1–8."
+            else:
+                self.data["motor_error"] = ""
 
     def snapshot(self, clock=None):
         clock = time.monotonic() if clock is None else clock
@@ -233,14 +348,19 @@ class StationReader:
             data = copy.deepcopy(self.data)
             age = None if self.changed is None else max(0, clock - self.changed)
             data["observation_age_ms"] = round(age * 1000) if age is not None else None
-            data["live"] = age is not None and age < FRESH_SECONDS and not data["error"]
+            # A cached queue tail can look recent on first read. Wait for the
+            # Station producer to publish another observation before a run.
+            data["live"] = self.observation_streak >= 2 and age is not None and age < FRESH_SECONDS and not data["error"]
+            camera_order = POLICY_CAMERAS if self.raw_cameras else CAMERAS
             data["camera_age_ms"] = {name: round(max(0, clock - self.image_changed[index]) * 1000)
-                                     if index in self.image_changed else None for name, index in CAMERAS.items()}
+                                     if index in self.image_changed else None for name, index in camera_order.items()}
             data["camera_live"] = {name: value is not None and value < FRESH_SECONDS * 1000 and data["live"]
                                    for name, value in data["camera_age_ms"].items()}
             # Model input must still contain fresh cameras and real joint feedback.
             policy_cameras_live = all(data["camera_live"].values())
             if self.raw_cameras:
+                policy_cameras_live = (policy_cameras_live and self.observation_cameras is not None
+                                       and self.observation_cameras == self._policy_camera_keys())
                 data["camera_age_ms"] = {
                     name: cam.get("age_ms", 0) + round(max(0, clock - self.camera_polled_at) * 1000)
                     if (cam := self.camera_metadata.get(name)) else None
@@ -251,8 +371,11 @@ class StationReader:
                     for name, age in data["camera_age_ms"].items()}
                 data["camera_frame_ids"] = {name: self.camera_metadata.get(name, {}).get("frame_id") for name in CAMERAS}
                 data["camera_sources"] = copy.deepcopy(self.camera_metadata)
+                data["camera_options"] = copy.deepcopy(self.camera_options)
+                data["camera_mapping_verified"] = not bool(self.camera_error) and "workspace" in self.camera_metadata
                 data["camera_error"] = self.camera_error
             else:
+                data["camera_mapping_verified"] = True
                 data["camera_frame_ids"] = {name: data["frame_id"] if index < len(self.images) else None
                                              for name, index in CAMERAS.items()}
             for motor in data["motors"]:
@@ -300,7 +423,8 @@ class StationReader:
         """Keep prediction input and its two review images from the same frame."""
         with self.lock:
             raw, snapshot = self.capture()
-            return raw, snapshot, {name: self.images[index] for name, index in CAMERAS.items()}
+            camera_order = POLICY_CAMERAS if self.raw_cameras else CAMERAS
+            return raw, snapshot, {name: self.images[index] for name, index in camera_order.items()}
 
     async def _mock_worker(self):
         import io

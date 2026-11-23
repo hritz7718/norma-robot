@@ -26,10 +26,14 @@ VISION_INSTRUCTIONS = INSTRUCTIONS.replace(
     "Do not claim to see the scene: no images or telemetry are provided to you.",
     "The attached image is the actual captured workspace camera frame. Inspect it directly; do not use tools."
 ) + """
-Identify the requested blue block in the attached image. Return visual.detected,
+Identify the single requested blue object in the attached image. Return visual.detected,
 an approximate bounding box in ORIGINAL IMAGE PIXELS (x0,y0,x1,y1), and confidence.
 The request gives the original image width and height. Do not invent table or
-robot coordinates. OpenCV will refine your bounding box. If unclear or occluded,
+robot coordinates. Your bounding box is the primary localization result: the
+backend uses its centre as the approximate object pixel coordinates. It does not
+require an OpenCV colour-mask confirmation. Use target.object=object for an
+identifiable requested object that is not a block/cube; do not substitute a
+different object just because it is blue. If unclear or occluded,
 set detected=false and confidence=0 with a zero bounding box. Do not claim a grasp.
 """
 

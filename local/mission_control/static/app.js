@@ -13,6 +13,7 @@
   let pollTimer;
   let polling = false;
   let closed = false;
+  let cameraOptionsKey = '';
   let speechEnabled = false;
   let spokenRisk = '';
   let speechPending = null;
@@ -86,8 +87,6 @@
     if (state.mode === 'simulation') return 'Simulation mode. Robot execution is disabled.';
     if (!state.config.checkpoint_available) return 'SmolVLA checkpoint is unavailable.';
     if (state.job?.status === 'running') return 'Waiting for the previous background job to finish.';
-    const hand = state.controller.hand_monitor;
-    if (!hand?.restart_allowed) return hand?.reason || 'Waiting for working hand detection.';
     if (!state.station.camera_live?.workspace) return state.station.camera_error || 'Waiting for a fresh workspace camera image.';
     return '';
   }
@@ -110,9 +109,13 @@
     $('execution-status').className = running && connected ? 'running' : '';
     text('action-count', `${state?.controller.commands_sent ?? 0} actions`);
     const controller = state?.controller;
+    text('execution-mode', controller?.execution_mode === 'direct_vla' ? 'Direct VLA · tabletop approach skipped.' :
+      controller?.execution_mode === 'positioned_vla' ? 'Positioning + VLA · calibrated approach, followed by SmolVLA.' :
+      'Execute chooses positioning + VLA when setup is valid; otherwise direct VLA.');
     text('run-time', controller?.timer_started ? running ?
       `${Math.ceil(controller.remaining_seconds ?? 0)}s left` : `${Math.floor(controller.elapsed_seconds ?? 0)}s elapsed` : '');
-    text('interpreted-instruction', controller?.prompt ? `${controller.interpretation_source || 'Interpreter'} → ${controller.prompt}` : '');
+    const detectedPixel=controller?.detection?.pixel;
+    text('interpreted-instruction', controller?.prompt ? `${controller.interpretation_source || 'Interpreter'} → ${controller.prompt}${detectedPixel ? ` · image coordinates (${detectedPixel.u.toFixed(1)}, ${detectedPixel.v.toFixed(1)}) px` : ''}` : '');
     $('interpreted-instruction').hidden = !controller?.prompt;
     let detail = 'Enter an instruction, then click Execute.';
     if (!connected) detail = 'Connection lost. Robot status is unavailable.';
@@ -134,15 +137,31 @@
   }
 
   function renderCameras() {
+    const choices=state?.station.camera_options || [];
+    const picker=$('workspace-camera');
+    const choiceKey=`${state?.csrf_token}:${choices.map(camera=>camera.unique_id).join('|')}`;
+    if(choiceKey!==cameraOptionsKey) {
+      cameraOptionsKey=choiceKey;
+      const placeholder=element('option','Choose tabletop camera');placeholder.value='';
+      picker.replaceChildren(placeholder,...choices.map((camera,index)=>{
+        const option=element('option',`Camera ${index+1} · ${camera.unique_id || camera.name}`);
+        option.value=camera.unique_id;return option;
+      }));
+    }
+    const verified=Boolean(state?.station.camera_mapping_verified);
+    if(verified) picker.value=state.station.camera_sources?.workspace?.unique_id || '';
+    picker.disabled=!connected || !choices.length;
+    $('camera-selection-help').hidden=verified || !choices.length;
     for (const name of cameraNames) {
       const image = $(`camera-${name}`);
       const camera = cameras[name];
       const live = connected && state?.station.camera_live?.[name];
       const frameId = (name === 'workspace' && state?.controller.hand_monitor?.overlay_frame_id) || state?.station.camera_frame_ids?.[name];
       const available = Boolean(frameId);
-      image.closest('.camera-card').classList.toggle('stale', !live);
+      const previewLive=live || (connected && !verified && state?.station.camera_sources?.[name]?.ready);
+      image.closest('.camera-card').classList.toggle('stale', !previewLive);
       text(`camera-status-${name}`, !connected ? 'Disconnected' : !available ? 'Waiting' :
-        !live ? 'Stale' : camera.loaded ? state.mode === 'simulation' ? 'Simulated' : 'Live' : 'Loading…');
+        !verified && previewLive ? 'Unassigned preview' : !live ? 'Stale' : camera.loaded ? state.mode === 'simulation' ? 'Simulated' : 'Live' : 'Loading…');
       if (!connected || !available) continue;
       const key = `${state.csrf_token}:${frameId}`;
       if (camera.key !== key) {
@@ -155,21 +174,20 @@
   function renderHandMonitor() {
     const hand = state?.controller.hand_monitor;
     const risk = !connected || !hand ? 'ERROR' : hand.level;
-    const stopped = hand?.latched || risk === 'RED' || risk === 'ERROR';
+    const urgent = risk === 'RED' || risk === 'ERROR';
     const banner = $('hand-warning');
-    banner.className = `hand-warning ${stopped ? 'red' : risk === 'YELLOW' ? 'yellow' : risk === 'CLEAR' ? 'clear' : ''}`;
+    banner.className = `hand-warning ${urgent ? 'red' : risk === 'YELLOW' ? 'yellow' : risk === 'CLEAR' ? 'clear' : ''}`;
     banner.textContent = !connected ? 'Hand monitor status unavailable. Check the backend connection.' :
-      !hand ? 'Waiting for hand monitor…' :
-      hand.latched && hand.restart_allowed ? `${hand.reason} STOP remains latched; click Execute to restart deliberately.` : hand.reason;
+      !hand ? 'Waiting for hand monitor…' : hand.reason;
     const card = $('camera-workspace').closest('.camera-card');
-    card.classList.toggle('hand-red', Boolean(stopped));
-    card.classList.toggle('hand-yellow', !stopped && risk === 'YELLOW');
+    card.classList.toggle('hand-red', urgent);
+    card.classList.toggle('hand-yellow', !urgent && risk === 'YELLOW');
     if (!speechEnabled || !('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') return;
     if (risk === spokenRisk || risk === speechPending || speechPending === 'TEST') return;
     const messages = {
       YELLOW: 'Warning. Please keep your hands clear of the robot.',
-      RED: 'Execution stopped. Please move your hand out of the work area.',
-      ERROR: 'Camera monitoring is unavailable. Execution is blocked.'
+      RED: 'Warning. Hand in the robot work area. Robot motion is still enabled.',
+      ERROR: 'Hand monitoring is unavailable. Check the workspace camera.'
     };
     const message = messages[risk];
     if (!message) { spokenRisk = risk; return; }
@@ -308,10 +326,10 @@
     const input = controller.image_input;
     text('diag-image-input', input ? `${input.interpreted ? 'Actual camera JPEG interpreted by Codex' : 'OpenCV fallback; Codex did not interpret the image'} · frame ${input.frame_id} · SHA ${input.sha256.slice(0, 12)}${input.reason ? ` · ${input.reason}` : ''}` : state.interpreter.image_supported ? 'Image attachment interface available; no image sent yet' : 'Codex images unavailable; OpenCV fallback');
     const detection = controller.detection;
-    text('diag-detection', detection ? `${detection.object} · ${detection.source} · score ${detection.confidence.toFixed(2)} · pixel ${detection.pixel.u.toFixed(1)},${detection.pixel.v.toFixed(1)} · table ${detection.table_mm.x.toFixed(1)},${detection.table_mm.y.toFixed(1)}mm (approximate projection)` : 'No confident detection yet');
+    text('diag-detection', detection ? `${detection.object} · ${detection.source} · score ${detection.confidence.toFixed(2)} · pixel ${detection.pixel.u.toFixed(1)},${detection.pixel.v.toFixed(1)}${detection.table_mm ? ` · table ${detection.table_mm.x.toFixed(1)},${detection.table_mm.y.toFixed(1)}mm (approximate projection)` : ' · image pixels only; no homography required'} · captured frame ${detection.frame_id}${detection.source === 'codex' ? ' · centre of Codex bounding box' : ''}` : 'No confident detection yet');
     const approach = controller.approach;
-    text('diag-approach', approach ? `${approach.method} · ${approach.position_estimated ? 'estimated ' : ''}table ${approach.target_table_mm.map((value) => value.toFixed(1)).join(', ')}mm${approach.target_robot_mm ? ` · robot ${approach.target_robot_mm.map((value) => value.toFixed(1)).join(', ')}mm` : ' · operator-validated taught height; no live Cartesian height feedback'}` : /(?:ROBOT|TAUGHT) ALIGNMENT REQUIRED|START POSE REQUIRED/.test(controller.error || '') ? controller.error : 'A validated nine-point mapping or measured robot alignment is required');
-    text('diag-handoff', `Approach ≤${Math.min(controller.max_delta_ticks, 50)} ticks; VLA ≤${Math.min(controller.max_delta_ticks, 100)} ticks, ≤20 seconds, using current observations`);
+    text('diag-approach', controller.execution_mode === 'direct_vla' ? `Skipped: direct VLA. ${controller.mode_reason || ''}` : approach ? `${approach.method} · ${approach.position_estimated ? 'estimated ' : ''}table ${approach.target_table_mm.map((value) => value.toFixed(1)).join(', ')}mm${approach.target_robot_mm ? ` · robot ${approach.target_robot_mm.map((value) => value.toFixed(1)).join(', ')}mm` : ' · operator-validated taught height; no live Cartesian height feedback'}` : 'Valid setup uses a calibrated approach; missing or invalid setup selects direct VLA.');
+    text('diag-handoff', controller.execution_mode === 'direct_vla' ? `Direct VLA ≤${Math.min(controller.max_delta_ticks, 100)} ticks per action, ≤${controller.duration_seconds}s, using current observations` : `Approach ≤${Math.min(controller.max_delta_ticks, 50)} ticks; VLA ≤${Math.min(controller.max_delta_ticks, 100)} ticks, ≤20 seconds, using current observations`);
     text('diag-verification', controller.verification ? `${controller.verification.status}: ${controller.verification.reason}` : 'No grasp verification result');
     const feedbackAges = station.motors.map((motor) => motor.age_ms).filter(Number.isFinite);
     text('diag-model', `${controller.model_state.replaceAll('_', ' ')}${controller.device ? ` · ${controller.device}` : ''}`);
@@ -421,6 +439,13 @@
   $('run-seconds').addEventListener('input', renderControls);
   $('max-delta-ticks').addEventListener('input', renderControls);
   $('safe-height-mm').addEventListener('input', renderControls);
+  $('workspace-camera').addEventListener('change',async()=>{
+    const uniqueId=$('workspace-camera').value;
+    if(!uniqueId) return;
+    showError();
+    try { await api('/api/workspace-camera',{camera_unique_id:uniqueId});await refresh(); }
+    catch(error) { showError(error.message); }
+  });
   $('execute-button').addEventListener('click', async () => {
     if ($('execute-button').disabled) return;
     executePending = true;

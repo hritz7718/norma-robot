@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 import json
 
 from .config import (FOLLOWER, MOTOR_IDS, ROBOT_ALIGNMENT, ROOT, MANUAL_CALIBRATION,
-                     TAUGHT_POINTS, TAUGHT_START_TOLERANCE_TICKS, TAUGHT_VLA_MAX_OFFSET_TICKS)
+                     TAUGHT_POINTS, TAUGHT_POINT_COUNT, TAUGHT_START_TOLERANCE_TICKS, TAUGHT_VLA_MAX_OFFSET_TICKS)
 from .vision import cancelled, VisionError
 
 
@@ -20,8 +20,19 @@ def homography_signature(calibration):
     return hashlib.sha256(json.dumps(geometry, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
+def teaching_point_count(record):
+    # Keep existing nine-point teaching intact; new teaching needs six poses.
+    count = (record or {}).get("point_count")
+    if count is None:
+        slots = [point.get("slot", 0) for point in (record or {}).get("points", [])]
+        count = 9 if any(slot > TAUGHT_POINT_COUNT for slot in slots) else TAUGHT_POINT_COUNT
+    if type(count) is not int or count not in (TAUGHT_POINT_COUNT, 9):
+        raise ValueError("Unsupported teaching set. Start a new six-pose set on the calibration page.")
+    return count
+
+
 class TaughtMapping:
-    """Piecewise linear interpolation of nine operator-validated joint poses.
+    """Piecewise linear interpolation of six operator-validated joint poses.
 
     Heights are measured during teaching, not observed or guaranteed by FK.
     Starts must match a taught pose; no automatic raising from arbitrary poses.
@@ -45,21 +56,22 @@ class TaughtMapping:
             if record.get("follower") != FOLLOWER or record.get("motor_ids") != list(MOTOR_IDS):
                 raise ValueError("teaching belongs to a different robot or motor order")
             if record.get("calibration_signature") != self.calibration_signature or record.get("camera_unique_id") != calibration["camera_unique_id"]:
-                raise ValueError("camera calibration changed; reteach the nine points")
+                raise ValueError("camera calibration changed; start a new teaching set for the current camera")
             if vision is not None and (vision.record.get("method") != "manual_four_point" or
                     vision.record["image_size"] != calibration["image_size"] or
                     not np.allclose(vision.record["image_to_table"], calibration["image_to_table"])):
                 raise ValueError("live camera calibration does not match teaching")
             points = sorted(record["points"], key=lambda point: point["slot"])
-            if len(points) != 9 or [point["slot"] for point in points] != list(range(1, 10)):
-                raise ValueError("save all nine teaching points first")
+            self.point_count = count = teaching_point_count(record)
+            if len(points) != count or [point["slot"] for point in points] != list(range(1, count+1)):
+                raise ValueError(f"{len(points)}/{count} robot poses saved. Open calibration and Save Pose for every remaining point")
             xyz = np.asarray([[point["table_mm"][axis] for axis in ("x", "y", "z")] for point in points], dtype=float)
             self.ticks = np.asarray([point["joint_ticks"] for point in points], dtype=float)
-            if xyz.shape != (9, 3) or self.ticks.shape != (9, 8) or not np.isfinite(xyz).all() or not np.isfinite(self.ticks).all():
-                raise ValueError("teaching requires nine finite XYZ coordinates and eight ticks per point")
+            if xyz.shape != (count, 3) or self.ticks.shape != (count, 8) or not np.isfinite(xyz).all() or not np.isfinite(self.ticks).all():
+                raise ValueError(f"each of the {count} poses needs measured X/Y/Z and eight recorded joint positions")
             self.safe_height = float(record["safe_height_mm"])
             if not math.isfinite(self.safe_height) or not 1 <= self.safe_height <= 500 or np.max(abs(xyz[:, 2]-self.safe_height)) > 1:
-                raise ValueError("all nine points must have the same measured safe height within 1mm")
+                raise ValueError("use the same measured gripper height for every pose (within 1mm)")
             if safe_height is not None and abs(float(safe_height)-self.safe_height) > 1:
                 raise ValueError(f"set Mission Control Approach height to the taught {self.safe_height:g}mm")
             self.xy = xyz[:, :2]
@@ -80,7 +92,7 @@ class TaughtMapping:
                 raise ValueError("live servo calibration differs from teaching")
             for ticks in self.ticks:
                 self.check_ticks(ticks)
-            # OpenCV is already installed. Triangles support an irregular nine-point grid.
+            # OpenCV triangles support six poses and existing nine-pose sets.
             origin = np.floor(self.xy.min(axis=0))-1
             size = np.ceil(self.xy.max(axis=0)-origin).astype(int)+2
             subdiv = cv2.Subdiv2D((0, 0, int(size[0]), int(size[1])))
@@ -101,7 +113,7 @@ class TaughtMapping:
                 if np.max(abs(self.interpolate(xy)-ticks)) > 1:
                     raise ValueError("interpolation does not reproduce the taught poses")
             if require_validation and (record.get("physically_validated") is not True or record.get("motion_enabled") is not True):
-                raise ValueError("preview and physically validate interpolation, then enable the taught controller on the calibration page")
+                raise ValueError("poses are saved but not enabled. Preview an in-between point, physically check it, then click Finish setup on the calibration page")
         except (OSError, KeyError, TypeError, ValueError, OverflowError, np.linalg.LinAlgError, cv2.error) as exc:
             raise AlignmentError(f"TAUGHT ALIGNMENT REQUIRED: {exc}.") from exc
 
@@ -129,7 +141,7 @@ class TaughtMapping:
                 ticks = self.np.rint(weights @ self.ticks[indices]).astype(int)
                 self.check_ticks(ticks)
                 return ticks
-        raise AlignmentError("Target is outside the nine-point taught region. Extrapolation is disabled.")
+        raise AlignmentError("Target is outside the region surrounded by your taught poses. Move the object inside that region, or reteach a wider reachable area.")
 
     def check_segment(self, start, end, *, approach=True):
         first, last = self.check_ticks(start), self.check_ticks(end)
@@ -141,13 +153,18 @@ class TaughtMapping:
             if any(self.np.max(abs(values[:7]-self.handoff_anchor[:7])) > TAUGHT_VLA_MAX_OFFSET_TICKS for values in (first, last)):
                 raise AlignmentError("VLA exceeded the supervised joint envelope around the taught approach.")
 
-    def plan(self, target_xy, current_raw, cancel):
-        self.assert_current()
+    def start_point(self, current_raw):
         current = self.check_ticks(current_raw)
         distances = self.np.max(abs(self.ticks-current), axis=1)
         start = int(self.np.argmin(distances))
         if distances[start] > TAUGHT_START_TOLERANCE_TICKS:
-            raise AlignmentError(f"START POSE REQUIRED: use teleoperation to return to a taught pose (nearest point {start+1}), then disable mirroring before Execute.")
+            raise AlignmentError(f"Current arm pose differs from nearest taught point {start+1} by "
+                                 f"{distances[start]:.0f} ticks (approach limit {TAUGHT_START_TOLERANCE_TICKS}).")
+        return start
+
+    def plan(self, target_xy, current_raw, cancel):
+        self.assert_current()
+        start = self.start_point(current_raw)
         target = self.np.asarray(target_xy, dtype=float)
         final = self.interpolate(target)
         count = max(1, int(math.ceil(self.np.linalg.norm(target-self.xy[start])/5)))
@@ -160,7 +177,7 @@ class TaughtMapping:
         return {"waypoints": waypoints, "target_ticks": final.tolist(),
                 "target_table_mm": [float(target[0]), float(target[1]), self.safe_height],
                 "target_robot_mm": None, "safe_height_mm": self.safe_height,
-                "start_point": start+1, "method": "nine-point joint interpolation",
+                "start_point": start+1, "method": f"{self.point_count}-point joint interpolation",
                 "verified": True, "position_estimated": True,
                 "height_control": "Operator-validated taught height; no live Cartesian height measurement"}
 
@@ -180,7 +197,7 @@ class RobotMapping:
             self.signature = hashlib.sha256(raw).hexdigest() if raw is not None else None
             self.config = config = json.loads(raw) if raw is not None else config
             if config.get("verified") is not True:
-                raise ValueError("robot_alignment.json has no verified physical robot alignment")
+                raise ValueError("robot positioning is not set up. Open the calibration page, teach six poses, validate them and click Finish setup")
             if config["follower"] != FOLLOWER or config["motor_ids"] != list(MOTOR_IDS):
                 raise ValueError("alignment belongs to a different robot or motor order")
             if config["mat_id"] != vision.record["mat_id"]:

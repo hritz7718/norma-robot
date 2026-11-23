@@ -76,6 +76,13 @@ class CameraReader:
                         envelope = usbvideo.RxEnvelopeReader(memoryview(bytes(envelope_entry.Data)))
                         info = envelope.get_camera()
                         name = info.get_product() or info.get_unique_id() or queue
+                        if envelope.get_type() in (usbvideo.RxEnvelopeType.ET_DEVICE_DISCONNECTED,
+                                                   usbvideo.RxEnvelopeType.ET_DEVICE_RECORDING_END):
+                            # Station versions before the registry fix retain old USB queues.
+                            # Retired devices must not hide the current wrist/workspace pair.
+                            with self.lock:
+                                self.frames.pop(queue, None)
+                            continue
                         if envelope.get_type() != usbvideo.RxEnvelopeType.ET_FRAMES:
                             with self.lock:
                                 self.frames[queue] = {"queue": queue, "name": name, "serial": info.get_serial_number(),

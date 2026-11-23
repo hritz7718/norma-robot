@@ -1,10 +1,16 @@
 # ElRobot Mission Control
 
-Execute runs: saved manual calibration (or automatic Bench Mat calibration) →
-fresh workspace JPEG → Codex image interpretation (or labelled OpenCV blue
-fallback) → OpenCV refinement → enabled nine-point interpolation (or measured
-ElRobot positioning) → the existing supervised SmolVLA loop.
+Execute captures a fresh workspace JPEG, uses Codex image interpretation (or
+labelled OpenCV blue fallback), then runs the existing persistent SmolVLA loop.
+Valid camera/robot setup adds a six-pose or URDF approach before VLA. Missing,
+incomplete or invalid setup selects direct VLA at startup, with no tabletop
+approach or Cartesian height control. Object/hand detection works in image
+pixels without homography. Both routes require live cameras, fault-free Follower
+feedback, calibrated servo limits and disabled mirroring. Hand alerts are warning-only.
 The existing UI, two camera streams, telemetry, logs, and STOP remain in use.
+Mission Control assembles model input from the selected workspace and wrist
+cameras and eight Follower joints in one synchronized Station snapshot. It can
+read joint positions with torque off, before Execute prepares the Follower.
 
 ## Launch
 
@@ -17,10 +23,18 @@ software/ai/smolvla_py/.venv/bin/python -m local.mission_control --port 8892 --s
 
 Open http://127.0.0.1:8892. Default duration is 120 seconds, requested max step
 300 ticks, and requested TCP height 200mm. The UI can change these before Execute.
+Approach height applies to the positioning route only. Direct VLA uses the
+requested duration and at most 100 ticks per joint per action; the positioned
+VLA handoff is limited to 20 seconds. The UI displays the selected route and
+logs its reason. Calibration or approach-planning failures during preflight
+select direct VLA using the same Execute click. After Follower preparation
+begins, execution faults stop the run and require another Execute click.
 Calibration, interpretation, model loading and planning issue no motor writes.
-The movement timer starts only after those prerequisites finish.
+The movement timer starts only after those prerequisites finish. Workspace
+camera identity is selected in the UI and saved in local/calibration/camera_source.json.
+WORKSPACE_CAMERA_ID in config.py supplies the initial identity.
 
-## Manual calibration and nine-point teaching
+## Saved camera calibration and six-pose teaching
 
 Launch the separate calibration page in another terminal:
 
@@ -32,19 +46,19 @@ Open http://127.0.0.1:8894/calibration. Capture the tabletop camera, select four
 points and enter their measured table X/Y coordinates in millimetres. Save the
 homography. These reference points do not restrict the task workspace.
 
-Use existing Leader → Follower teleoperation to teach nine reachable table
+Use existing Leader → Follower teleoperation to teach six reachable table
 positions at the same measured gripper height and consistent orientation and
 opening. Save Point captures fresh, stationary feedback for all eight Follower
 motors. The separate page never commands motion or changes torque/mirroring.
 The grasp point is midway between the fingertips; X/Y refer to its tabletop
 projection and Z is its measured height above the tabletop.
 
-After all nine points are saved, preview an intermediate X/Y, physically
+After all six poses are saved, preview an intermediate X/Y, physically
 validate the interpolated positions and clearance, confirm the checkbox and
-enable the taught controller. Execute uses piecewise linear joint interpolation
-inside the taught region. Start from any taught pose, disable mirroring using
-the existing supported-arm handover, keep Follower feedback/torque available,
-and clear hands from the camera zone before Execute. Approach commands are
+click Finish setup. Execute uses piecewise linear joint interpolation
+inside the taught region when the current pose matches a taught pose. Other
+poses use direct VLA. Disable mirroring using the existing supported-arm
+handover and keep Follower feedback available before Execute. Approach commands are
 bounded to 50 ticks or the smaller operator limit. Joint feedback confirms
 arrival; Cartesian height remains an operator-validated estimate.
 
@@ -60,9 +74,11 @@ MediaPipe runs on the main workspace camera in a separate backend thread.
 Landmarks, bounding boxes and independent camera-space warning/exclusion zones
 appear in the workspace feed. The homography reference box is not a hand zone.
 HAND_EXCLUSION_RECT in config.py defines the red area in normalized image
-coordinates; the remaining image is yellow. Red detections, stale camera frames
-or detector failures block further VLA commands. Recovery requires a deliberate
-Execute click; STOP does not disable torque or stop existing teleoperation.
+coordinates; the remaining image is yellow. Hand detections and detector failures
+produce visual/spoken warnings without stopping VLA or blocking Execute. Stale
+robot observations or camera frames still stop commands independently. Manual
+STOP requires a deliberate Execute click to restart and does not disable torque
+or stop existing teleoperation.
 
 Browser speech announces warnings with a cooldown. Click Test voice to enable
 audio and use the voice selector to preview/save an available browser voice.
@@ -126,8 +142,10 @@ measured tcp_table_mm position. Samples must span XY and at least 10mm in Z;
 the supplied ElRobot URDF mapping must reproduce them within 3mm.
 Set registration_verified, workspace_clearance_verified and verified only
 after the actual measurements. This URDF route is the alternative when no
-nine-point teaching file is present. A present but invalid teaching file blocks
-motion rather than silently switching controllers.
+taught-pose file is present. Existing nine-pose sets remain supported. Invalid
+teaching, URDF calibration, or an unavailable approach selects direct VLA during
+preflight. The mode label and logs show which route was selected. After Follower
+preparation begins, geometry or file changes stop the run.
 
 The planner reuses hardware/elrobot/simulation/elrobot_follower.urdf. It checks
 FK, solves a fixed-orientation TCP approach, samples bounded joint segments,
@@ -141,7 +159,14 @@ stalls or changed servo calibration stop before VLA handoff.
 The former text-only call is replaced in Execute by the installed CLI's
 --image attachment with a captured JPEG and a vision response schema.
 The existing audited CLI/version restrictions and login are retained.
-The response supplies an approximate pixel box; OpenCV refines the blue mask.
+The response supplies an approximate pixel box; its centre supplies the primary
+object coordinates, reported with source=codex. A valid Codex result does not
+require an OpenCV colour-mask confirmation. The overlay labels this as the last
+Codex snapshot result; it does not claim live object tracking. In direct mode,
+SmolVLA uses fresh live camera observations rather than a frozen pixel target.
+The calibrated positioning route refreshes Codex coordinates after model loading
+before computing its tabletop approach. Homography supplies millimetres only
+when valid; Codex itself supplies image pixels, never invented robot coordinates.
 If image interpretation is unavailable, only an explicitly identified single
 blue-block pickup can use the labelled OpenCV fallback. No successful Codex
 image interpretation is claimed in that case. Image frame ID/hash and source
